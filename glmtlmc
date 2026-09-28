@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""glmtlmc — patch, unpatch, or update a Prism Launcher instance for the Mesa-zink stack."""
+
+import glob
+import json
+import os
+import platform
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_INTERVAL = 0.08
+PROBE_TIMEOUT = 20
+INDENT = "  "
+
+MINECRAFT_VERSION = "26.2"
+STACK_KEYS = ("OverrideJavaArgs", "JvmArgs", "OverrideCommands", "WrapperCommand")
+
+IS_TTY = sys.stdout.isatty()
+RED = "\033[31m" if IS_TTY else ""
+GREEN = "\033[32m" if IS_TTY else ""
+RESET = "\033[0m" if IS_TTY else ""
+
+ACTIVE_LINE = None
+
+
+class PhaseError(Exception):
+    """A phase failure with a message shown to the user."""
+
+
+class PhaseLine:
+    """One phase status line; animates a braille spinner while the work runs."""
+
+    def __init__(self, title):
+        global ACTIVE_LINE
+        ACTIVE_LINE = self
+        self.title = title
+        self._stop = None
+        if IS_TTY:
+            sys.stdout.write(title + " ")
+            sys.stdout.flush()
+            self._spin_up()
+        else:
+            print(title)
+
+    def _spin_up(self):
+        self._stop = threading.Event()
+        threading.Thread(target=self._animate, daemon=True).start()
+
+    def _animate(self):
+        index = 0
+        while True:
+            frame = SPINNER_FRAMES[index % len(SPINNER_FRAMES)]
+            sys.stdout.write("\r" + self.title + " " + frame)
+            sys.stdout.flush()
+            if self._stop.wait(SPINNER_INTERVAL):
+                break
+            index += 1
+
+    def detail(self, message):
+        """Pause the spinner, print an indented detail line, resume."""
+        if self._stop is None:
+            print(INDENT + message)
+            return
+        self._stop.set()
+        sys.stdout.write("\r\033[K")
+        print(INDENT + message)
+        self._spin_up()
+
+    def _wind_down(self):
+        global ACTIVE_LINE
+        if self._stop is not None:
+            self._stop.set()
+            sys.stdout.write("\r\033[K")
+            self._stop = None
+        ACTIVE_LINE = None
+
+    def done(self):
+        """Persist the phase line on its own row."""
+        if self._stop is not None:
+            self._wind_down()
+            print(self.title)
+
+    def fail(self, reason):
+        """Persist the phase line, then the indented error under it."""
+        if self._stop is not None:
+            self._wind_down()
+            print(self.title)
+        print(RED + INDENT + "error: " + reason + RESET)
+
+
+def is_macho(path):
+    macho_magics = (
+        b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
+        b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    )
+    with open(path, "rb") as handle:
+        return handle.read(4) in macho_magics
+
+
+def read_file_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def write_atomically(path, content):
+    temporary = path + ".glmtlmc.tmp"
+    with open(temporary, "wb") as handle:
+        handle.write(content)
+    os.replace(temporary, path)
+
+
+def strip_surrounding_quotes(text):
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def iter_key_values(content):
+    """Yield (key, value) for each `key=value` line, split on the first `=`."""
+    for line in content.decode("utf-8", "surrogateescape").splitlines():
+        if line.lstrip().startswith(("[", "#")):
+            continue
+        key, separator, value = line.partition("=")
+        if separator:
+            yield key, value
+
+
+def is_already_patched(content):
+    for key, value in iter_key_values(content):
+        if key == "WrapperCommand" and "libgl_interpose" in value \
+                and "MESA_LOADER_DRIVER_OVERRIDE=zink" in value:
+            return True
+    return False
+
+
+def general_section_bounds(lines):
+    """(start, end) of the [General] section, end exclusive; None if missing."""
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == "[General]":
+            start = index
+            break
+    if start is None:
+        return None
+    for index in range(start + 1, len(lines)):
+        if lines[index].lstrip().startswith("["):
+            return start, index
+    return start, len(lines)
+
+
+def find_key_line(lines, key, start, end):
+    for index in range(start + 1, end):
+        candidate, separator, _ = lines[index].partition("=")
+        if separator and candidate.rstrip("\r") == key:
+            return index
+    return None
+
+
+def last_key_line_index(lines, start, end):
+    """Index of the last `key=value` line in the section; the header if none."""
+    last = start
+    for index in range(start + 1, end):
+        line = lines[index]
+        if "=" in line and not line.lstrip().startswith("#"):
+            last = index
+    return last
+
+
+def line_ending(line):
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith(("\n", "\r")):
+        return line[-1:]
+    return ""
+
+
+def upsert_ini_keys(content, values):
+    """Set each `key=value` inside [General], preserving every other byte."""
+    lines = content.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+    for key, value in values.items():
+        bounds = general_section_bounds(lines)
+        if bounds is None:
+            raise PhaseError("instance.cfg has no [General] section")
+        start, end = bounds
+        index = find_key_line(lines, key, start, end)
+        if index is not None:
+            lines[index] = key + "=" + value + line_ending(lines[index])
+        else:
+            anchor = last_key_line_index(lines, start, end)
+            if not lines[anchor].endswith(("\n", "\r")):
+                lines[anchor] += "\n"
+            lines.insert(anchor + 1, key + "=" + value + "\n")
+    return "".join(lines).encode("utf-8", "surrogateescape")
+
+
+def remove_ini_keys(content, keys):
+    """Drop every `key=value` line whose key is in `keys`; keep all else."""
+    lines = content.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+    kept = []
+    for line in lines:
+        candidate, separator, _ = line.partition("=")
+        if separator and candidate.rstrip("\r") in keys:
+            continue
+        kept.append(line)
+    return "".join(kept).encode("utf-8", "surrogateescape")
+
+
+def restore_ini_keys(current_content, backup_content):
+    """Return current content with the 4 stack keys set to the backup state."""
+    backup_values = dict(iter_key_values(backup_content))
+    present = {key: backup_values[key] for key in STACK_KEYS if key in backup_values}
+    absent = [key for key in STACK_KEYS if key not in backup_values]
+    content = upsert_ini_keys(current_content, present)
+    return remove_ini_keys(content, absent)
+
+
+def resolve_mesa_prefix(script_dir):
+    """Environment override, then the stack shipped next to the script, then ~/mesa-native."""
+    explicit = os.environ.get("GLMTLMC_MESA_PREFIX")
+    if explicit:
+        return os.path.abspath(explicit)
+    stack_prefix = os.path.join(script_dir, "stack")
+    if os.path.isfile(os.path.join(stack_prefix, "lib", "libEGL.dylib")):
+        return os.path.abspath(stack_prefix)
+    return os.path.abspath(os.path.expanduser("~/mesa-native"))
+
+
+def find_vulkan_icd(prefix):
+    """First Vulkan ICD (sorted) whose library exists; (path, api_version) or None."""
+    explicit = os.environ.get("GLMTLMC_ICD")
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = sorted(glob.glob(
+            os.path.join(prefix, "share", "vulkan", "icd.d", "*.json")))
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            library = manifest["ICD"]["library_path"]
+            api_version = manifest["ICD"].get("api_version", "unknown")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if not os.path.isabs(library):
+            library = os.path.join(os.path.dirname(candidate), library)
+        if os.path.isfile(library):
+            return candidate, api_version
+    return None
+
+
+def find_glfw_dylib(script_dir):
+    explicit = os.environ.get("GLMTLMC_GLFW_LIB")
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = [
+            os.path.join(script_dir, "stack", "lib", "libglfw.3.dylib"),
+            os.path.join(script_dir, "..", "GL46-Exp", "glfw", "build", "src", "libglfw.3.dylib"),
+            os.path.join(script_dir, "glfw", "build", "src", "libglfw.3.dylib"),
+            os.path.join(script_dir, "..", "glfw", "build", "src", "libglfw.3.dylib"),
+        ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def dequarantine(script_dir):
+    """Strip Gatekeeper quarantine from the shipped stack and shaderpacks."""
+    for folder in ("stack", "shaderpacks"):
+        target = os.path.join(script_dir, folder)
+        if os.path.isdir(target):
+            subprocess.run(
+                ["xattr", "-dr", "com.apple.quarantine", target],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def build_patch_values(prefix, glfw_path, icd_path):
+    return {
+        "OverrideJavaArgs": "true",
+        "JvmArgs": ('"-Dorg.lwjgl.egl.libname=' + prefix + '/lib/libEGL.dylib'
+                    + ' -Dorg.lwjgl.opengl.libname=' + prefix + '/lib/libGL.dylib'
+                    + ' -Dorg.lwjgl.glfw.libname=' + glfw_path + '"'),
+        "OverrideCommands": "true",
+        "WrapperCommand": ('"env DYLD_INSERT_LIBRARIES=' + prefix + '/lib/libgl_interpose.dylib'
+                           + ' DYLD_LIBRARY_PATH=' + prefix + '/lib'
+                           + ' LIBGL_DRIVERS_PATH=' + prefix + '/lib/dri'
+                           + ' VK_DRIVER_FILES=' + icd_path
+                           + ' VK_ICD_FILENAMES=' + icd_path
+                           + ' EGL_PLATFORM=surfaceless'
+                           + ' MESA_LOADER_DRIVER_OVERRIDE=zink'
+                           + ' MESA_GL_VERSION_OVERRIDE=4.6'
+                           + ' MESA_GLSL_VERSION_OVERRIDE=460"'),
+    }
+
+
+def stack_paths(stack):
+    prefix = stack["prefix"]
+    return [
+        os.path.join(prefix, "lib", "libEGL.dylib"),
+        os.path.join(prefix, "lib", "libGL.dylib"),
+        stack["glfw_path"],
+        os.path.join(prefix, "lib", "libgl_interpose.dylib"),
+        os.path.join(prefix, "lib"),
+        os.path.join(prefix, "lib", "dri"),
+        stack["icd_path"],
+    ]
+
+
+PROBE_CODE = """import ctypes
+import sys
+PREFIX = "__PREFIX__"
+EGL_NONE = 0x3038
+EGL_VENDOR = 0x3053
+EGL_VERSION = 0x3054
+EGL_OPENGL_API = 0x30A2
+EGL_CONTEXT_MAJOR_VERSION = 0x3098
+EGL_CONTEXT_MINOR_VERSION = 0x30FB
+GL_RENDERER = 0x1F01
+GL_VERSION = 0x1F02
+
+def fail(message):
+    sys.stderr.write("probe: " + message + "\\n")
+    sys.exit(1)
+
+egl = ctypes.CDLL(PREFIX + "/lib/libEGL.dylib", mode=ctypes.RTLD_GLOBAL)
+gl = ctypes.CDLL(PREFIX + "/lib/libGL.dylib", mode=ctypes.RTLD_GLOBAL)
+egl.eglGetDisplay.restype = ctypes.c_void_p
+egl.eglGetDisplay.argtypes = [ctypes.c_void_p]
+egl.eglInitialize.restype = ctypes.c_uint
+egl.eglInitialize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+egl.eglBindAPI.restype = ctypes.c_uint
+egl.eglBindAPI.argtypes = [ctypes.c_uint]
+egl.eglQueryString.restype = ctypes.c_char_p
+egl.eglQueryString.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+egl.eglCreateContext.restype = ctypes.c_void_p
+egl.eglCreateContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+egl.eglMakeCurrent.restype = ctypes.c_uint
+egl.eglMakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+gl.glGetString.restype = ctypes.c_char_p
+gl.glGetString.argtypes = [ctypes.c_uint]
+
+display = egl.eglGetDisplay(0)
+if not display:
+    fail("eglGetDisplay(EGL_DEFAULT_DISPLAY) returned EGL_NO_DISPLAY")
+if not egl.eglInitialize(display, None, None):
+    fail("eglInitialize failed")
+print("EGL_VENDOR: " + egl.eglQueryString(display, EGL_VENDOR).decode())
+print("EGL_VERSION: " + egl.eglQueryString(display, EGL_VERSION).decode())
+if not egl.eglBindAPI(EGL_OPENGL_API):
+    fail("eglBindAPI(EGL_OPENGL_API) failed")
+attribs = (ctypes.c_int * 5)(EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 6, EGL_NONE)
+context = egl.eglCreateContext(display, None, None, attribs)
+if not context:
+    print("probe note: GL 4.6 attribs refused, retrying without version attribs")
+    context = egl.eglCreateContext(display, None, None, None)
+if not context:
+    fail("eglCreateContext could not create a surfaceless context")
+if not egl.eglMakeCurrent(display, None, None, context):
+    fail("eglMakeCurrent failed for the surfaceless context")
+renderer = gl.glGetString(GL_RENDERER)
+if not renderer:
+    fail("glGetString(GL_RENDERER) returned NULL")
+print("GL_RENDERER: " + renderer.decode())
+print("GL_VERSION: " + gl.glGetString(GL_VERSION).decode())
+"""
+
+
+def probe_environment(prefix, icd_path):
+    env = dict(os.environ)
+    env.update({
+        "DYLD_INSERT_LIBRARIES": prefix + "/lib/libgl_interpose.dylib",
+        "DYLD_LIBRARY_PATH": prefix + "/lib",
+        "LIBGL_DRIVERS_PATH": prefix + "/lib/dri",
+        "VK_DRIVER_FILES": icd_path,
+        "VK_ICD_FILENAMES": icd_path,
+        "EGL_PLATFORM": "surfaceless",
+        "MESA_LOADER_DRIVER_OVERRIDE": "zink",
+        "MESA_GL_VERSION_OVERRIDE": "4.6",
+        "MESA_GLSL_VERSION_OVERRIDE": "460",
+        "MESA_VULKAN_LIBRARY": prefix + "/lib/libvulkan.1.dylib",
+    })
+    return env
+
+
+def run_translation_probe(prefix, icd_path):
+    snippet = PROBE_CODE.replace("__PREFIX__", prefix)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", snippet],
+            env=probe_environment(prefix, icd_path),
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise PhaseError("Translation Layer probe timed out after 20 seconds")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise PhaseError(stderr if stderr
+                         else "probe exited with code " + str(completed.returncode))
+    return [line for line in completed.stdout.strip().splitlines() if line]
+
+
+def verify_hardware(line):
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        raise PhaseError("this stack requires Apple Silicon macOS")
+
+
+def verify_instance_version(line, instance_dir):
+    pack_path = os.path.join(instance_dir, "mmc-pack.json")
+    with open(pack_path, "r", encoding="utf-8") as handle:
+        pack = json.load(handle)
+    components = pack.get("components", []) if isinstance(pack, dict) else []
+    version = None
+    for component in components:
+        if isinstance(component, dict) and component.get("uid") == "net.minecraft":
+            version = component.get("version") or component.get("cachedVersion")
+            break
+    if version != MINECRAFT_VERSION:
+        raise PhaseError("instance is " + str(version or "missing")
+                         + ", expected " + MINECRAFT_VERSION)
+
+
+def probe_report(line, script_dir, stack):
+    prefix = resolve_mesa_prefix(script_dir)
+    egl_path = os.path.join(prefix, "lib", "libEGL.dylib")
+    if not os.path.isfile(egl_path):
+        raise PhaseError(egl_path + " not found (set GLMTLMC_MESA_PREFIX)")
+    icd = find_vulkan_icd(prefix)
+    if icd is None:
+        raise PhaseError("no usable Vulkan ICD found under " + prefix)
+    for report_line in run_translation_probe(prefix, icd[0]):
+        line.detail(report_line)
+    stack["prefix"] = prefix
+    stack["icd_path"] = icd[0]
+    stack["icd_api_version"] = icd[1]
+
+
+def configure_mesa(line, stack):
+    prefix = stack["prefix"]
+    for required in (
+        os.path.join(prefix, "lib", "libEGL.dylib"),
+        os.path.join(prefix, "lib", "libGL.dylib"),
+        os.path.join(prefix, "lib", "libgl_interpose.dylib"),
+    ):
+        if not os.path.isfile(required):
+            raise PhaseError(required + " not found")
+    dri_dir = os.path.join(prefix, "lib", "dri")
+    if not os.path.isdir(dri_dir) or not os.listdir(dri_dir):
+        raise PhaseError(dri_dir + " not found or empty")
+    line.detail(prefix)
+
+
+def configure_kosmickrisp(line, stack):
+    line.detail(stack["icd_path"] + " (api_version " + stack["icd_api_version"] + ")")
+
+
+def link_translation_layer(line, script_dir, stack):
+    glfw_path = find_glfw_dylib(script_dir)
+    if glfw_path is None:
+        raise PhaseError("patched GLFW dylib not found (set GLMTLMC_GLFW_LIB)")
+    if " " in glfw_path:
+        raise PhaseError("glmtlmc requires a space-free path (current: " + glfw_path + ")")
+    if not is_macho(glfw_path):
+        raise PhaseError("not a Mach-O dylib: " + glfw_path)
+    line.detail(glfw_path)
+    stack["glfw_path"] = glfw_path
+
+
+def configure_custom_arguments(line, instance_dir, stack):
+    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"])
+    cfg_path = os.path.join(instance_dir, "instance.cfg")
+    content = read_file_bytes(cfg_path)
+    if not is_already_patched(content):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        with open(os.path.join(instance_dir, "instance.cfg.glmtlmc.bak-" + stamp), "wb") as handle:
+            handle.write(content)
+    write_atomically(cfg_path, upsert_ini_keys(content, values))
+
+
+def verify_startup(line, instance_dir, stack):
+    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"])
+    current = dict(iter_key_values(read_file_bytes(os.path.join(instance_dir, "instance.cfg"))))
+    for key, expected in values.items():
+        if current.get(key) != expected:
+            raise PhaseError(key + " does not match the value written by glmtlmc")
+    for path in stack_paths(stack):
+        if not os.path.exists(path):
+            raise PhaseError(path + " not found")
+    line.detail("instance.cfg verified, all stack paths exist")
+
+
+def do_nothing(line):
+    pass
+
+
+def verify_instance_state(line, instance_dir):
+    cfg_path = os.path.join(instance_dir, "instance.cfg")
+    if not is_already_patched(read_file_bytes(cfg_path)):
+        raise PhaseError("instance is not patched")
+
+
+def locate_backup(line, instance_dir, state):
+    backups = glob.glob(os.path.join(instance_dir, "instance.cfg.glmtlmc.bak-*"))
+    if not backups:
+        raise PhaseError("no backup found — cannot restore automatically")
+    state["backup_path"] = max(backups)
+    line.detail(os.path.basename(state["backup_path"]))
+
+
+def restore_configuration(line, instance_dir, state):
+    cfg_path = os.path.join(instance_dir, "instance.cfg")
+    backup_content = read_file_bytes(state["backup_path"])
+    current_content = read_file_bytes(cfg_path)
+    write_atomically(cfg_path, restore_ini_keys(current_content, backup_content))
+
+
+def verify_vanilla_startup(line, instance_dir, state):
+    cfg_path = os.path.join(instance_dir, "instance.cfg")
+    current = dict(iter_key_values(read_file_bytes(cfg_path)))
+    backup = dict(iter_key_values(read_file_bytes(state["backup_path"])))
+    for key in STACK_KEYS:
+        if current.get(key) != backup.get(key):
+            raise PhaseError(key + " does not match the backup state")
+
+
+def patch_phases(instance_dir, script_dir):
+    stack = {}
+    return [
+        ("Verifying hardware compatibility", lambda line: verify_hardware(line)),
+        ("Verifying instance version", lambda line: verify_instance_version(line, instance_dir)),
+        ("Getting report from Translation Layer", lambda line: probe_report(line, script_dir, stack)),
+        ("Configuring MESA", lambda line: configure_mesa(line, stack)),
+        ("Configuring KosmikKrisp", lambda line: configure_kosmickrisp(line, stack)),
+        ("Linking Translation Layer", lambda line: link_translation_layer(line, script_dir, stack)),
+        ("Configuring Custom Arguments", lambda line: configure_custom_arguments(line, instance_dir, stack)),
+        ("Verifying instance startup", lambda line: verify_startup(line, instance_dir, stack)),
+        ("Cleaning up", do_nothing),
+        ("Finalizing", do_nothing),
+    ]
+
+
+def unpatch_phases(instance_dir):
+    state = {}
+    return [
+        ("Verifying instance state", lambda line: verify_instance_state(line, instance_dir)),
+        ("Locating original configuration", lambda line: locate_backup(line, instance_dir, state)),
+        ("Restoring launch configuration", lambda line: restore_configuration(line, instance_dir, state)),
+        ("Verifying vanilla startup", lambda line: verify_vanilla_startup(line, instance_dir, state)),
+        ("Cleaning up", do_nothing),
+        ("Finalizing", do_nothing),
+    ]
+
+
+def run_operation(phases):
+    for title, action in phases:
+        line = PhaseLine(title)
+        try:
+            action(line)
+        except (PhaseError, OSError) as failure:
+            line.fail(str(failure))
+            return 1
+        line.done()
+    return 0
+
+
+def print_finish(started, error_count):
+    elapsed = time.monotonic() - started
+    seconds = int(elapsed)
+    milliseconds = int((elapsed - seconds) * 1000)
+    print("Finished in " + str(seconds) + ":" + str(milliseconds))
+    if error_count:
+        print(RED + "Errors: " + str(error_count) + RESET)
+    else:
+        print(GREEN + "No errors" + RESET)
+
+
+def ensure_inside_project():
+    """Signature-check the folder around the script, then work from inside it.
+
+    Double-clicked runs start with cwd=$HOME, so any starting directory is fine
+    as long as the script sits next to README.md (a lone copied script is not).
+    """
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    if not os.path.isfile(os.path.join(script_dir, "README.md")):
+        print(RED + "Error: run the script inside glmtlmc folder" + RESET)
+        sys.exit(1)
+    os.chdir(script_dir)
+    return script_dir
+
+
+def refuse_if_launcher_running():
+    """Refuse while Prism or a launched instance is live: Prism keeps the
+    instance settings in memory, so it would both launch stale config and
+    overwrite the patch on instance close."""
+    for check in (("pgrep", "-i", "prismlauncher"), ("pgrep", "-f", "java-runtime")):
+        found = subprocess.run(check, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+        if found.returncode == 0:
+            print(RED + "Error: quit Prism Launcher (and any running instance)"
+                  + " first, then run glmtlmc again" + RESET)
+            sys.exit(1)
+
+
+def ask_instance_location():
+    print("Location of the instance?")
+    try:
+        raw = input()
+    except EOFError:
+        print(RED + "Error: no instance location given" + RESET)
+        sys.exit(1)
+    path = os.path.expanduser(strip_surrounding_quotes(raw.strip()))
+    if not os.path.isdir(path):
+        print(RED + "Error: directory not found: " + path + RESET)
+        sys.exit(1)
+    for required in ("instance.cfg", "mmc-pack.json"):
+        if not os.path.isfile(os.path.join(path, required)):
+            print(RED + "Error: " + required + " not found in " + path + RESET)
+            sys.exit(1)
+    return path
+
+
+def ask_operation():
+    print("1 : Patch")
+    print("2 : Unpatch")
+    print("3 : Update glmtlmc")
+    try:
+        choice = input().strip().lower()
+    except EOFError:
+        choice = ""
+    if choice in ("1", "patch"):
+        return "patch"
+    if choice in ("2", "unpatch"):
+        return "unpatch"
+    if choice in ("3", "update"):
+        return "patch"
+    print(RED + "Error: unknown choice" + RESET)
+    sys.exit(1)
+
+
+def main():
+    script_dir = ensure_inside_project()
+    refuse_if_launcher_running()
+    instance_dir = ask_instance_location()
+    operation = ask_operation()
+    if operation == "unpatch":
+        phases = unpatch_phases(instance_dir)
+    else:
+        phases = patch_phases(instance_dir, script_dir)
+    dequarantine(script_dir)
+    started = time.monotonic()
+    error_count = run_operation(phases)
+    print_finish(started, error_count)
+    sys.exit(1 if error_count else 0)
+
+
+def pause_before_exit():
+    """Double-click UX: keep the Terminal window open until the user reads it.
+
+    Piped/automated runs (either stream not a TTY) must exit without pausing.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    print()
+    print("Press Enter to exit...")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        if ACTIVE_LINE is not None:
+            ACTIVE_LINE._wind_down()
+        print()
+        sys.exit(130)
+    finally:
+        pause_before_exit()

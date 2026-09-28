@@ -1,0 +1,94 @@
+diff -ruN a/shaders/lib/common.glsl b/shaders/lib/common.glsl
+--- a/shaders/lib/common.glsl	2026-09-14 21:06:00
++++ b/shaders/lib/common.glsl	2026-09-27 13:08:00
+@@ -30,7 +30,7 @@
+ 
+     #define COLORED_LIGHTING 0 //[128 192 256 384 512 768 1024]
+     #define WORLD_SPACE_REFLECTIONS -1 //[-1 1]
+-    #if defined IRIS_FEATURE_CUSTOM_IMAGES && SHADOW_QUALITY > -1 && !defined MC_OS_MAC && !(defined DH_TERRAIN || defined DH_WATER || defined VOXY_PATCH)
++    #if defined IRIS_FEATURE_CUSTOM_IMAGES && SHADOW_QUALITY > -1 && !(defined DH_TERRAIN || defined DH_WATER || defined VOXY_PATCH) // [patched] removed OS-vendor device gate
+         #define COLORED_LIGHTING_INTERNAL COLORED_LIGHTING
+         #if COLORED_LIGHTING_INTERNAL > 0
+             #define COLORED_LIGHT_FOG
+@@ -690,7 +690,7 @@
+         #define DH_BLENDING
+     #endif
+ 
+-    #if IMPROVED_RAIN_DEFINE == 1 && !defined MC_OS_MAC && !defined COLOR_CODED_PROGRAMS && MC_VERSION >= 11605
++    #if IMPROVED_RAIN_DEFINE == 1 && !defined COLOR_CODED_PROGRAMS && MC_VERSION >= 11605 // [patched] removed OS-vendor device gate
+         #define IMPROVED_RAIN
+     #endif
+ 
+diff -ruN a/shaders/lib/util/commonFunctions.glsl b/shaders/lib/util/commonFunctions.glsl
+--- a/shaders/lib/util/commonFunctions.glsl	2026-08-18 19:49:22
++++ b/shaders/lib/util/commonFunctions.glsl	2026-09-27 13:03:30
+@@ -1,4 +1,4 @@
+-// Do these via macro as Apple otherwise complains
++// Done via macro for driver compatibility
+ #define SUN_ROTATION_DATA vec2(cos(sunPathRotation * 0.01745329251994), -sin(sunPathRotation * 0.01745329251994))
+ 
+ #ifdef OVERWORLD
+diff -ruN a/shaders/program/composite1.glsl b/shaders/program/composite1.glsl
+--- a/shaders/program/composite1.glsl	2026-07-31 18:37:48
++++ b/shaders/program/composite1.glsl	2026-09-27 13:08:00
+@@ -20,12 +20,7 @@
+ #define ALLOW_REFRACTION
+ #define SMOOTHNESS_AFFECTED_REF_BLUR
+ 
+-#if defined MC_OS_MAC && (defined DISTANT_HORIZONS || defined VOXY)
+-    // Remove the uses of colortex6 to stay below the 8 sampler limit of macos
+-    #undef IRIS_FEATURE_FADE_VARIABLE
+-    #undef ALLOW_REFRACTION
+-    #undef SMOOTHNESS_AFFECTED_REF_BLUR
+-#endif
++// [patched] removed OS-vendor sampler-limit workaround (GL 4.6 zink exposes enough samplers)
+ 
+ //Common Variables//
+ float SdotU = dot(sunVec, upVec);
+diff -ruN a/shaders/program/final.glsl b/shaders/program/final.glsl
+--- a/shaders/program/final.glsl	2026-08-18 22:51:22
++++ b/shaders/program/final.glsl	2026-09-27 13:08:00
+@@ -20,9 +20,7 @@
+     #define OPTIFINE_AF_ERROR
+ #endif
+ 
+-#if COLORED_LIGHTING > 0 && defined MC_OS_MAC
+-    #define APPLE_ACT_ERROR
+-#endif
++// [patched] removed OS-vendor device gate (ACT works on GL 4.6 zink)
+ 
+ #if COLORED_LIGHTING > 0 && (!defined IS_IRIS || !defined IRIS_FEATURE_CUSTOM_IMAGES)
+     #define OPTIFINE_ACT_ERROR
+@@ -128,8 +126,6 @@
+         #include "/lib/textRendering/error_multiple_lod_mods.glsl"
+     #elif defined OPTIFINE_AF_ERROR
+         #include "/lib/textRendering/error_optifine_af.glsl"
+-    #elif defined APPLE_ACT_ERROR
+-        #include "/lib/textRendering/error_apple_act.glsl"
+     #elif defined OPTIFINE_ACT_ERROR
+         #include "/lib/textRendering/error_optifine_act.glsl"
+     #elif defined WSR_MISSING_ACT_ERROR
+diff -ruN a/shaders/shaders.properties b/shaders/shaders.properties
+--- a/shaders/shaders.properties	2026-09-14 09:30:46
++++ b/shaders/shaders.properties	2026-09-27 13:08:00
+@@ -68,10 +68,7 @@
+     sliders=shadowDistance BLOOM_STRENGTH CLOUD_ALT1 CLOUD_ALT2 TM_EXPOSURE TM_CONTRAST T_SATURATION T_VIBRANCE MOTION_BLURRING_STRENGTH NORMAL_MAP_STRENGTH CUSTOM_EMISSION_INTENSITY IMAGE_SHARPENING SUN_ANGLE ATM_FOG_MULT ATM_FOG_DISTANCE ATM_FOG_ALTITUDE CAVE_LIGHTING GR_RR GR_RG GR_RB GR_RC GR_GR GR_GG GR_GB GR_GC GR_BR GR_BG GR_BB GR_BC POM_DEPTH POM_QUALITY POM_DISTANCE WATER_BUMPINESS WATER_BUMP_SMALL WATER_BUMP_MED WATER_BUMP_BIG WATER_SPEED_MULT WATER_SIZE_MULT WATER_REFRACTION_INTENSITY SELECT_OUTLINE_I SELECT_OUTLINE_R SELECT_OUTLINE_G SELECT_OUTLINE_B LIGHT_NOON_R LIGHT_NOON_G LIGHT_NOON_B LIGHT_NOON_I ATM_NOON_R ATM_NOON_G ATM_NOON_B ATM_NOON_I LIGHT_MORNING_R LIGHT_MORNING_G LIGHT_MORNING_B LIGHT_MORNING_I ATM_MORNING_R ATM_MORNING_G ATM_MORNING_B ATM_MORNING_I LIGHT_NIGHT_R LIGHT_NIGHT_G LIGHT_NIGHT_B LIGHT_NIGHT_I ATM_NIGHT_R ATM_NIGHT_G ATM_NIGHT_B ATM_NIGHT_I LIGHT_RAIN_R LIGHT_RAIN_G LIGHT_RAIN_B LIGHT_RAIN_I ATM_RAIN_R ATM_RAIN_G ATM_RAIN_B ATM_RAIN_I LIGHT_NETHER_R LIGHT_NETHER_G LIGHT_NETHER_B LIGHT_NETHER_I ATM_NETHER_R ATM_NETHER_G ATM_NETHER_B ATM_NETHER_I LIGHT_END_R LIGHT_END_G LIGHT_END_B LIGHT_END_I ATM_END_R ATM_END_G ATM_END_B ATM_END_I WORLD_OUTLINE_I AMBIENT_MULT GENERATED_NORMAL_MULT COATED_TEXTURE_MULT LIGHTSHAFT_NOON_I LIGHTSHAFT_SUNSET_I LIGHTSHAFT_NIGHT_I LIGHTSHAFT_RAIN_I WATERCOLOR_R WATERCOLOR_G WATERCOLOR_B WATER_FOAM_I WATER_ALPHA_MULT WATER_FOG_MULT UNDERWATERCOLOR_R UNDERWATERCOLOR_G UNDERWATERCOLOR_B GLOWING_ORE_MULT SSAO_I VANILLAAO_I CHROMA_ABERRATION XLIGHT_R XLIGHT_G XLIGHT_B NIGHT_NEBULA_I WEATHER_TEX_OPACITY NETHER_STORM_LOWER_ALT NETHER_STORM_HEIGHT NETHER_STORM_I CLOUD_UNBOUND_AMOUNT CLOUD_UNBOUND_SIZE_MULT CLOUD_UNBOUND_RAIN_ADD CLOUD_SPEED_MULT WB_DOF_I WB_DOF_FOCUS WB_DB_DAY_I WB_DB_NIGHT_I WB_DB_RAIN_I WB_DB_WATER_I WB_DB_NETHER_I WB_DB_END_I WAVING_SPEED WAVING_I MOON_PHASE_FULL MOON_PHASE_PARTIAL MOON_PHASE_DARK LENSFLARE_I SHADOW_SMOOTHING BLOCKLIGHT_FLICKERING NETHER_VIEW_LIMIT CLOUD_R CLOUD_G CLOUD_B WAVING_I_RAIN_MULT COLORED_LIGHT_FOG_I XLIGHT_I COLORED_LIGHT_SATURATION PIXEL_SCALE TM_DARK_DESATURATION TM_WHITE_PATH NIGHT_STAR_AMOUNT FXAA_TAA_INTERACTION FXAA_STRENGTH LIGHTSHAFT_SUNSET_SATURATION XLIGHT_CURVE END_BEAM_INTENSITY END_BEAM_CENTER_ALT END_BEAM_HEIGHT END_STAR_INTENSITY GENERATED_NORMAL_RES ACT_FIRE_COLOR_WARMNESS
+ 
+ # Special Define Handling
+-    # Needed to disable colored lighting related code in shaders.properties
+-    #ifdef MC_OS_MAC
+-        #define COLORED_LIGHTING 0
+-    #endif
++    # [patched] removed OS-vendor device gating (works on GL 4.6 zink)
+ 
+ # Pipeline Settings
+     oldHandLight = false
+@@ -146,7 +143,7 @@
+         clouds=off
+     #endif
+ 
+-    #if IMPROVED_RAIN_DEFINE == 1 && !defined MC_OS_MAC && MC_VERSION >= 11605
++    #if IMPROVED_RAIN_DEFINE == 1 && MC_VERSION >= 11605
+         blend.gbuffers_weather.colortex12=off
+     #endif
+ 
