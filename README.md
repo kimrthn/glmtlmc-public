@@ -24,6 +24,7 @@ Validated shaderpack compatibility, including Complementary Reimagined, with kno
 
 - Apple Silicon Mac. M3 is the only tested generation; other Apple Silicon models are unverified.
 - Prism Launcher and a Minecraft Java Edition instance configured with Fabric, Iris, and Sodium.
+- sudo xattr -cr ing the glmtlmc-public folder so it works without gatekeeper errors.
 
 *Complementary Reimagined local patcher*
 
