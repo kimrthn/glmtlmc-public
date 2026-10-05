@@ -5,26 +5,72 @@ import glob
 import json
 import os
 import platform
+import plistlib
+import re
+import shutil
+import struct
 import subprocess
 import sys
-import threading
-import time
+import tempfile
 from datetime import datetime
+from xml.parsers.expat import ExpatError
 
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-SPINNER_INTERVAL = 0.08
 PROBE_TIMEOUT = 20
+BUILD_TIMEOUT = 120
 INDENT = "  "
+# Verb column width: wide enough for the longest verb, so the leaf names and the
+# paths line up under each other and a transcript reads as a table.
+VERB_WIDTH = 11
 
 MINECRAFT_VERSION = "26.2"
 STACK_KEYS = ("OverrideJavaArgs", "JvmArgs", "OverrideCommands", "WrapperCommand")
+VR_LIB_NAME = "vr-lib"
+VR_GL_FIX_LIB = "libvr_glfix.dylib"
+VR_GL_FIX_SOURCE = "vr-glfix/vr_glfix.c"
+VR_GL_FIX_INTERPOSE_BYTES = 400
+INTERPOSE_TUPLE_BYTES = 16
+VR_GL_FIX_REDIRECTS = 25
+MOLTENVR_SHIM_LIB = "libopenvr_api.dylib"
+MOLTENVR_LWJGL_LIB = "liblwjgl_openvr.dylib"
+MOLTENVR_APP = "/Applications/MoltenVR.app"
+MOLTENVR_MIN_VERSION = (1, 0, 2)
+MOLTENVR_ZGC_FLAG = "-XX:+UseZGC"
+MOLTENVR_PATH_FLAGS = ("-Dorg.lwjgl.librarypath=", "-Djava.library.path=")
+MOLTENVR_JVM_FLAGS = MOLTENVR_PATH_FLAGS + (MOLTENVR_ZGC_FLAG,)
+IRIS_SHADER_BREAK_VERSION = (1, 11, 3)
+IRIS_SHADER_SAFE_VERSION = (1, 11, 2)
+IRIS_ISSUE = "IrisShaders/Iris issue #3373"
+MOD_LOADER_WORDS = ("fabric", "forge", "neoforge", "quilt")
+DOTTED_VERSION = re.compile(r"\d+(?:\.\d+)+")
+DECIMAL_DIGITS = "0123456789"
+HEX_DIGITS = DECIMAL_DIGITS + "abcdefABCDEF"
+
+BACKUP_PREFIX = "instance.cfg.glmtlmc.bak-"
+BACKUP_STAMP = "%Y%m%d-%H%M%S"
+TEMP_SUFFIX = ".glmtlmc.tmp"
+TEMP_BUILD_PREFIX = "glmtlmc-vr-glfix-"
+QUARANTINE_ATTR = "com.apple.quarantine"
+
+MH_MAGIC_64 = 0xFEEDFACF
+FAT_MAGIC_BYTES = b"\xca\xfe\xba\xbe"
+CPU_TYPE_ARM64 = 0x0100000C
+LC_SEGMENT_64 = 0x19
+MACHO_HEADER_BYTES = 32
+MACHO_MAGIC_BYTES = 4
+MACHO_CPUTYPE_BYTES = 4
+MACHO_COMMAND_BYTES = 8
+MACHO_COUNT_BYTES = 4
+MACHO_SLICE_BYTES = 20
+MACHO_NCMDS_OFFSET = 16
+SECTION_64_BYTES = 80
+SEGMENT_SECTCOUNT_OFFSET = 56
+SEGMENT_SECTIONS_OFFSET = 64
+SECTION_NAME_BYTES = 16
+SECTION_SIZE_OFFSET = 40
 
 IS_TTY = sys.stdout.isatty()
 RED = "\033[31m" if IS_TTY else ""
-GREEN = "\033[32m" if IS_TTY else ""
 RESET = "\033[0m" if IS_TTY else ""
-
-ACTIVE_LINE = None
 
 
 class PhaseError(Exception):
@@ -32,63 +78,27 @@ class PhaseError(Exception):
 
 
 class PhaseLine:
-    """One phase status line; animates a braille spinner while the work runs."""
+    """One phase: its title, the rows beneath it, and its failure.
+
+    Every phase prints its title as it starts, so a row always lands under the
+    heading it belongs to and a run that stops reads as a transcript ending at
+    the phase that broke.
+    """
 
     def __init__(self, title):
-        global ACTIVE_LINE
-        ACTIVE_LINE = self
         self.title = title
-        self._stop = None
-        if IS_TTY:
-            sys.stdout.write(title + " ")
-            sys.stdout.flush()
-            self._spin_up()
-        else:
-            print(title)
-
-    def _spin_up(self):
-        self._stop = threading.Event()
-        threading.Thread(target=self._animate, daemon=True).start()
-
-    def _animate(self):
-        index = 0
-        while True:
-            frame = SPINNER_FRAMES[index % len(SPINNER_FRAMES)]
-            sys.stdout.write("\r" + self.title + " " + frame)
-            sys.stdout.flush()
-            if self._stop.wait(SPINNER_INTERVAL):
-                break
-            index += 1
+        print(title)
 
     def detail(self, message):
-        """Pause the spinner, print an indented detail line, resume."""
-        if self._stop is None:
-            print(INDENT + message)
-            return
-        self._stop.set()
-        sys.stdout.write("\r\033[K")
+        """One indented row of prose under the title."""
         print(INDENT + message)
-        self._spin_up()
 
-    def _wind_down(self):
-        global ACTIVE_LINE
-        if self._stop is not None:
-            self._stop.set()
-            sys.stdout.write("\r\033[K")
-            self._stop = None
-        ACTIVE_LINE = None
-
-    def done(self):
-        """Persist the phase line on its own row."""
-        if self._stop is not None:
-            self._wind_down()
-            print(self.title)
+    def report(self, verb, detail):
+        """One indented row saying what happened to what: verb, then the subject."""
+        print(INDENT + verb.ljust(VERB_WIDTH) + detail)
 
     def fail(self, reason):
-        """Persist the phase line, then the indented error under it."""
-        if self._stop is not None:
-            self._wind_down()
-            print(self.title)
+        """The indented error under the title that failed."""
         print(RED + INDENT + "error: " + reason + RESET)
 
 
@@ -102,16 +112,112 @@ def is_macho(path):
         return handle.read(4) in macho_magics
 
 
+def read_exactly(handle, count, path):
+    """`count` bytes, or a PhaseError naming the file that ran out.
+
+    A short read is the one shape a malformed image always takes, and it must be
+    an error rather than a struct.error traceback.
+    """
+    chunk = handle.read(count)
+    if len(chunk) != count:
+        raise PhaseError(path + " ends " + str(count - len(chunk))
+                         + " bytes early, where a Mach-O structure should be")
+    return chunk
+
+
+def arm64_slice_offset(handle, path):
+    """Where the arm64 slice starts in an open Mach-O; 0 for a thin image.
+
+    A universal file is a big-endian count of slice records, a thin one a
+    little-endian header at the front. Anything else is a parse error: a reader
+    that guesses here would go on to report a section size for the wrong bytes.
+    """
+    magic = read_exactly(handle, MACHO_MAGIC_BYTES, path)
+    if magic != FAT_MAGIC_BYTES:
+        if struct.unpack("<I", magic)[0] != MH_MAGIC_64:
+            raise PhaseError(path + " is not a 64-bit Mach-O image")
+        if struct.unpack("<I", read_exactly(handle, MACHO_CPUTYPE_BYTES, path))[0] != CPU_TYPE_ARM64:
+            raise PhaseError(path + " is not an arm64 Mach-O image")
+        return 0
+    entries = struct.unpack(">I", read_exactly(handle, MACHO_COUNT_BYTES, path))[0]
+    for _ in range(entries):
+        record = read_exactly(handle, MACHO_SLICE_BYTES, path)
+        cputype, _subtype, offset, _size, _align = struct.unpack(">iiIII", record)
+        if cputype == CPU_TYPE_ARM64:
+            return offset
+    raise PhaseError(path + " is a universal binary with no arm64 slice")
+
+
+def interpose_section_size(path):
+    """Byte size of __interpose in a Mach-O, read from its own load commands.
+
+    The VR fix lives or dies on this number: 25 tuples of 16 bytes is a real
+    redirection table, 16 bytes is a single tuple, which is what a build emits
+    when each trampoline took the name of the symbol it displaces. Read here in
+    Python rather than parsed out of otool's prose, and never assumed — a file
+    that cannot be read is an error, not a default.
+    """
+    with open(path, "rb") as handle:
+        handle.seek(arm64_slice_offset(handle, path))
+        header = read_exactly(handle, MACHO_HEADER_BYTES, path)
+        commands = struct.unpack_from("<I", header, MACHO_NCMDS_OFFSET)[0]
+        for _ in range(commands):
+            prologue = read_exactly(handle, MACHO_COMMAND_BYTES, path)
+            command, size = struct.unpack("<2I", prologue)
+            if size < MACHO_COMMAND_BYTES:
+                raise PhaseError(path + " declares a " + str(size) + "-byte load command")
+            body = read_exactly(handle, size - MACHO_COMMAND_BYTES, path)
+            if command != LC_SEGMENT_64 or len(body) < SEGMENT_SECTIONS_OFFSET:
+                continue
+            section_count = struct.unpack_from("<I", body, SEGMENT_SECTCOUNT_OFFSET)[0]
+            for index in range(section_count):
+                start = SEGMENT_SECTIONS_OFFSET + index * SECTION_64_BYTES
+                section = body[start:start + SECTION_64_BYTES]
+                if len(section) != SECTION_64_BYTES:
+                    raise PhaseError(path + " declares a section table it does not carry")
+                name = section[:SECTION_NAME_BYTES].split(b"\0")[0].decode("utf-8", "replace")
+                if name == "__interpose":
+                    return struct.unpack_from("<Q", section, SECTION_SIZE_OFFSET)[0]
+    raise PhaseError(path + " carries no __interpose section")
+
+
+def nm_symbols(path):
+    """{symbol name: nm type letter} for every symbol in an arm64 dylib."""
+    completed = run_tool(["xcrun", "nm", "-arch", "arm64", path])
+    if completed.returncode != 0:
+        raise PhaseError("nm could not read " + path
+                         + " (" + (completed.stderr.strip() or str(completed.returncode)) + ")")
+    symbols = {}
+    for row in completed.stdout.splitlines():
+        fields = row.split()
+        if len(fields) == 3 and fields[0][0] in HEX_DIGITS:
+            symbols[fields[2]] = fields[1]
+        elif len(fields) == 2:
+            symbols[fields[1]] = fields[0]
+    return symbols
+
+
+def is_code_signed(path):
+    """Whether dyld will load the image: codesign must find a signature."""
+    return run_tool(["codesign", "-dv", path]).returncode == 0
+
+
 def read_file_bytes(path):
     with open(path, "rb") as handle:
         return handle.read()
 
 
-def write_atomically(path, content):
-    temporary = path + ".glmtlmc.tmp"
+def write_atomically(line, path, content):
+    """The one write path every config goes through, so the bytes and the report agree.
+
+    The staged file never survives the call, so the row names the path a reader
+    will actually find rather than the temporary one.
+    """
+    temporary = path + TEMP_SUFFIX
     with open(temporary, "wb") as handle:
         handle.write(content)
     os.replace(temporary, path)
+    line.report("wrote", path)
 
 
 def strip_surrounding_quotes(text):
@@ -219,6 +325,63 @@ def restore_ini_keys(current_content, backup_content):
     return remove_ini_keys(content, absent)
 
 
+def without_line_ending(text):
+    """text less its trailing terminator, so it compares like an iter_key_values value."""
+    ending = line_ending(text)
+    return text if not ending else text[:-len(ending)]
+
+
+def general_key_values(content):
+    """{key: value} for the keys in [General], the section upsert_ini_keys writes.
+
+    First line wins, the same rule find_key_line applies, and the terminator comes
+    off, the same rule iter_key_values applies: a report built from this cannot
+    disagree with the write that follows it.
+    """
+    lines = content.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+    bounds = general_section_bounds(lines)
+    if bounds is None:
+        return {}
+    start, end = bounds
+    values = {}
+    for index in range(start + 1, end):
+        key, separator, value = lines[index].partition("=")
+        if separator:
+            values.setdefault(key.rstrip("\r"), without_line_ending(value))
+    return values
+
+
+def set_verdicts(current, values):
+    """(verb, detail) per key in values, in config order: set, or kept as it was."""
+    verdicts = []
+    for key, value in values.items():
+        if current.get(key) == value:
+            verdicts.append(("kept", key + " (already correct)"))
+        else:
+            verdicts.append(("set", key))
+    return verdicts
+
+
+def restore_verdicts(current_content, backup_content):
+    """(verb, detail) per stack key: restored, dropped, or already as backed up.
+
+    A key the backup never had is a key glmtlmc added, so unpatching removes it.
+    """
+    backed_up = dict(iter_key_values(backup_content))
+    present = general_key_values(current_content)
+    verdicts = []
+    for key in STACK_KEYS:
+        if key not in backed_up:
+            if key in present:
+                verdicts.append(("removed", key))
+            continue
+        if present.get(key) == backed_up[key]:
+            verdicts.append(("kept", key + " (already as backed up)"))
+        else:
+            verdicts.append(("restored", key))
+    return verdicts
+
+
 def resolve_mesa_prefix(script_dir):
     """Environment override, then the stack shipped next to the script, then ~/mesa-native."""
     explicit = os.environ.get("GLMTLMC_MESA_PREFIX")
@@ -270,25 +433,125 @@ def find_glfw_dylib(script_dir):
     return None
 
 
+def quarantined_count(folder):
+    """How many paths under folder carry the quarantine attribute right now.
+
+    xattr says nothing when it strips the attribute, so the count has to come
+    from asking before stripping: a report line has to be able to say "0 files"
+    and be right.
+    """
+    listing = subprocess.run(["xattr", "-r", folder],
+                             capture_output=True, text=True, check=False)
+    suffix = ": " + QUARANTINE_ATTR
+    return sum(1 for row in listing.stdout.splitlines() if row.endswith(suffix))
+
+
+def plural(count, noun):
+    return str(count) + " " + noun + ("" if count == 1 else "s")
+
+
 def dequarantine(script_dir):
-    """Strip Gatekeeper quarantine from the shipped stack and shaderpacks."""
+    """Strip Gatekeeper quarantine from the shipped stack and shaderpacks.
+
+    Undoing a quarantine edits the extended attributes of every file it touches,
+    so it is reported the same way as a write even though nothing was rewritten.
+    """
+    cleared = []
     for folder in ("stack", "shaderpacks"):
         target = os.path.join(script_dir, folder)
-        if os.path.isdir(target):
-            subprocess.run(
-                ["xattr", "-dr", "com.apple.quarantine", target],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if not os.path.isdir(target):
+            continue
+        cleared.append((folder, quarantined_count(target)))
+        subprocess.run(
+            ["xattr", "-dr", QUARANTINE_ATTR, target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if not cleared:
+        return
+    line = PhaseLine("Clearing quarantine")
+    for folder, count in cleared:
+        line.report("cleared", folder + " (" + plural(count, "file") + ")")
 
 
-def build_patch_values(prefix, glfw_path, icd_path):
+def run_tool(command, timeout=None):
+    """One developer tool, output captured; a tool that is not there is a failure."""
+    try:
+        return subprocess.run(command, capture_output=True, text=True,
+                              check=False, timeout=timeout)
+    except OSError as failure:
+        raise PhaseError("cannot run " + command[0] + " (" + str(failure) + ")"
+                         + " — the Xcode command line tools must be installed")
+
+
+def jvm_arg_tokens(content):
+    """The flags Prism will hand the JVM, tokenised out of the JvmArgs value."""
+    jvm_args = dict(iter_key_values(content)).get("JvmArgs", "")
+    return strip_surrounding_quotes(jvm_args).split()
+
+
+def wrapper_env_pairs(content):
+    """The WrapperCommand's `env` assignments, as (name, value) pairs."""
+    command = dict(iter_key_values(content)).get("WrapperCommand", "")
+    pairs = []
+    for token in strip_surrounding_quotes(command).split():
+        name, separator, value = token.partition("=")
+        if separator:
+            pairs.append((name, value))
+    return pairs
+
+
+def moltenvr_jvm_flags(content):
+    """MoltenVR's own JvmArgs flags, in place and without duplicates.
+
+    Its "Enable VR" button writes them into the same JvmArgs line glmtlmc owns,
+    so a plain patch run would delete them. No flags means no-op.
+    """
+    flags = []
+    for token in jvm_arg_tokens(content):
+        if token.startswith(MOLTENVR_JVM_FLAGS) and token not in flags:
+            flags.append(token)
+    return flags
+
+
+def preserved_vr_glfix(content):
+    """The libvr_glfix.dylib path the instance already injects, or None.
+
+    glmtlmc rewrites WrapperCommand wholesale, so without this the VR fix a user
+    deployed by hand would be dropped by a plain patch and the VR segfault would
+    come back with nothing to say what removed it.
+    """
+    injected = dict(wrapper_env_pairs(content)).get("DYLD_INSERT_LIBRARIES", "")
+    for path in injected.split(":"):
+        if path and os.path.basename(path) == VR_GL_FIX_LIB:
+            return path
+    return None
+
+
+def stack_search_dir(stack):
+    """Where DYLD_LIBRARY_PATH points: the stack's lib/, or vr-lib in VR mode."""
+    return stack.get("search_dir") or stack["prefix"] + "/lib"
+
+
+def build_patch_values(prefix, glfw_path, icd_path, search_dir=None, preserved_flags=(), injected=()):
+    """The four keys glmtlmc owns.
+
+    search_dir defaults to the stack's lib/. preserved_flags are MoltenVR's own
+    JvmArgs flags and injected the extra dylibs to add after libgl_interpose.dylib,
+    both so a re-patch merges instead of overwriting.
+    """
+    search_dir = prefix + "/lib" if search_dir is None else search_dir
+    jvm_flags = [
+        "-Dorg.lwjgl.egl.libname=" + prefix + "/lib/libEGL.dylib",
+        "-Dorg.lwjgl.opengl.libname=" + prefix + "/lib/libGL.dylib",
+        "-Dorg.lwjgl.glfw.libname=" + glfw_path,
+    ]
+    jvm_flags.extend(preserved_flags)
+    inserted = [search_dir + "/libgl_interpose.dylib"] + list(injected)
     return {
         "OverrideJavaArgs": "true",
-        "JvmArgs": ('"-Dorg.lwjgl.egl.libname=' + prefix + '/lib/libEGL.dylib'
-                    + ' -Dorg.lwjgl.opengl.libname=' + prefix + '/lib/libGL.dylib'
-                    + ' -Dorg.lwjgl.glfw.libname=' + glfw_path + '"'),
+        "JvmArgs": '"' + " ".join(jvm_flags) + '"',
         "OverrideCommands": "true",
-        "WrapperCommand": ('"env DYLD_INSERT_LIBRARIES=' + prefix + '/lib/libgl_interpose.dylib'
-                           + ' DYLD_LIBRARY_PATH=' + prefix + '/lib'
+        "WrapperCommand": ('"env DYLD_INSERT_LIBRARIES=' + ":".join(inserted)
+                           + ' DYLD_LIBRARY_PATH=' + search_dir
                            + ' LIBGL_DRIVERS_PATH=' + prefix + '/lib/dri'
                            + ' VK_DRIVER_FILES=' + icd_path
                            + ' VK_ICD_FILENAMES=' + icd_path
@@ -301,7 +564,7 @@ def build_patch_values(prefix, glfw_path, icd_path):
 
 def stack_paths(stack):
     prefix = stack["prefix"]
-    return [
+    paths = [
         os.path.join(prefix, "lib", "libEGL.dylib"),
         os.path.join(prefix, "lib", "libGL.dylib"),
         stack["glfw_path"],
@@ -310,6 +573,112 @@ def stack_paths(stack):
         os.path.join(prefix, "lib", "dri"),
         stack["icd_path"],
     ]
+    search_dir = stack.get("search_dir")
+    if search_dir:
+        paths.append(search_dir)
+        paths.extend(target for _, target in vr_link_targets(search_dir))
+    paths.extend(stack.get("injected_libraries", ()))
+    return paths
+
+
+def vr_search_exclusion(name):
+    """Why this image has to stay out of the VR search path, or None if it can go in.
+
+    libGL.dylib loses its leaf-name race to Apple's OpenGL framework, and the
+    GLFW fork is loaded by absolute path, so neither belongs there. Every other
+    image in lib/ has a unique leaf name.
+    """
+    if name == "libGL.dylib":
+        return "it would shadow the system OpenGL"
+    if name.startswith("libglfw"):
+        return "GLFW is loaded by absolute path"
+    return None
+
+
+def lib_image_names(prefix):
+    """Every image in the stack's lib/, ordered by leaf name."""
+    lib_dir = os.path.join(prefix, "lib")
+    return sorted(name for name in os.listdir(lib_dir)
+                  if os.path.isfile(os.path.join(lib_dir, name)))
+
+
+def vr_link_names(prefix):
+    """The images the VR search dir carries: every file in lib/ minus the two
+    dyld could substitute for a system one."""
+    return [name for name in lib_image_names(prefix)
+            if not vr_search_exclusion(name)]
+
+
+def vr_link_skips(prefix):
+    """(name, reason) for each lib/ image that stays out of the VR search dir."""
+    skipped = []
+    for name in lib_image_names(prefix):
+        reason = vr_search_exclusion(name)
+        if reason:
+            skipped.append((name, reason))
+    return skipped
+
+
+def vr_link_targets(vr_dir):
+    """(name, resolved target) for each symlink in vr-lib."""
+    return [(name, os.path.join(vr_dir, os.readlink(os.path.join(vr_dir, name))))
+            for name in sorted(os.listdir(vr_dir))
+            if os.path.islink(os.path.join(vr_dir, name))]
+
+
+def link_vr_lib_entry(vr_dir, name):
+    """Point one vr-lib entry at lib/; (verb, detail) for the change, else None.
+
+    Relative links keep the directory valid if the prefix is moved, and a real
+    file sitting at the name is left alone rather than clobbered.
+    """
+    path = os.path.join(vr_dir, name)
+    target = os.path.join("..", "lib", name)
+    if os.path.islink(path) and os.readlink(path) == target:
+        return None
+    if os.path.lexists(path) and not os.path.islink(path):
+        return "left out", name + " (a real file is sitting there)"
+    repaired = os.path.lexists(path)
+    try:
+        if repaired:
+            os.remove(path)
+        os.symlink(target, path)
+    except OSError as failure:
+        raise PhaseError("cannot write " + path + " (" + str(failure) + ") — "
+                         + vr_dir + " must be writable for VR patching")
+    return ("repaired" if repaired else "linked"), name + " -> " + target
+
+
+def link_summary(placed, kept):
+    """One row in place of the run of identical link results above it.
+
+    Counts that came out at zero are left out rather than printed as a "0
+    repaired" that implies work nobody did. A name that was left alone is not a
+    link, so it never reaches the tally and is named in its own row instead.
+    """
+    counts = [(verb, placed.count(verb)) for verb in ("linked", "repaired")]
+    parts = [str(count) + " " + verb for verb, count in counts if count]
+    parts.append(str(kept) + " already in place")
+    return ", ".join(parts)
+
+
+def prepare_vr_search_dir(line, prefix):
+    """<prefix>/vr-lib, a sibling of lib/ that mirrors it without libGL.
+
+    Never moves or copies anything in lib/; falling back to lib/ here would
+    reintroduce the exact collision VR patching exists to remove.
+    """
+    vr_dir = os.path.join(prefix, VR_LIB_NAME)
+    if os.path.isdir(vr_dir):
+        line.report("present", VR_LIB_NAME)
+        return vr_dir
+    try:
+        os.makedirs(vr_dir, exist_ok=True)
+    except OSError as failure:
+        raise PhaseError("cannot create " + vr_dir + " (" + str(failure) + ") — "
+                         "VR patching needs a writable stack prefix")
+    line.report("created", VR_LIB_NAME)
+    return vr_dir
 
 
 PROBE_CODE = """import ctypes
@@ -371,11 +740,12 @@ print("GL_VERSION: " + gl.glGetString(GL_VERSION).decode())
 """
 
 
-def probe_environment(prefix, icd_path):
+def probe_environment(prefix, icd_path, search_dir=None):
+    search_dir = prefix + "/lib" if search_dir is None else search_dir
     env = dict(os.environ)
     env.update({
-        "DYLD_INSERT_LIBRARIES": prefix + "/lib/libgl_interpose.dylib",
-        "DYLD_LIBRARY_PATH": prefix + "/lib",
+        "DYLD_INSERT_LIBRARIES": search_dir + "/libgl_interpose.dylib",
+        "DYLD_LIBRARY_PATH": search_dir,
         "LIBGL_DRIVERS_PATH": prefix + "/lib/dri",
         "VK_DRIVER_FILES": icd_path,
         "VK_ICD_FILENAMES": icd_path,
@@ -383,20 +753,200 @@ def probe_environment(prefix, icd_path):
         "MESA_LOADER_DRIVER_OVERRIDE": "zink",
         "MESA_GL_VERSION_OVERRIDE": "4.6",
         "MESA_GLSL_VERSION_OVERRIDE": "460",
-        "MESA_VULKAN_LIBRARY": prefix + "/lib/libvulkan.1.dylib",
+        "MESA_VULKAN_LIBRARY": search_dir + "/libvulkan.1.dylib",
     })
     return env
 
 
-def run_translation_probe(prefix, icd_path):
+def run_translation_probe(prefix, icd_path, search_dir=None):
     snippet = PROBE_CODE.replace("__PREFIX__", prefix)
     try:
         completed = subprocess.run(
             [sys.executable, "-c", snippet],
-            env=probe_environment(prefix, icd_path),
+            env=probe_environment(prefix, icd_path, search_dir),
             capture_output=True, text=True, timeout=PROBE_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise PhaseError("Translation Layer probe timed out after 20 seconds")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise PhaseError(stderr if stderr
+                         else "probe exited with code " + str(completed.returncode))
+    return [line for line in completed.stdout.strip().splitlines() if line]
+
+
+VR_PROBE_CODE = """import ctypes
+import os
+import sys
+PREFIX = "__PREFIX__"
+SHIM = "__SHIM__"
+LIBRARY_DIRS = __LIBRARY_DIRS__
+FRAMEWORK = "/System/Library/Frameworks/OpenGL.framework/Versions/A"
+OPENGL_FRAMEWORK = FRAMEWORK + "/OpenGL"
+APPLE_LIBGL = FRAMEWORK + "/Libraries/libGL.dylib"
+SHIM_NAMES = ("libopenvr_api.dylib", "liblwjgl_openvr.dylib")
+
+def fail(message):
+    sys.stderr.write("vr probe: " + message + "\\n")
+    sys.exit(1)
+
+core = ctypes.CDLL(None)
+core._dyld_image_count.restype = ctypes.c_uint
+core._dyld_get_image_name.restype = ctypes.c_char_p
+core._dyld_get_image_name.argtypes = [ctypes.c_uint]
+
+def loaded_images():
+    return [core._dyld_get_image_name(index).decode() or ""
+            for index in range(core._dyld_image_count())]
+
+if not LIBRARY_DIRS:
+    fail("no library path in the JvmArgs to resolve the shim through")
+
+ctypes.CDLL(OPENGL_FRAMEWORK, mode=ctypes.RTLD_GLOBAL)
+ctypes.CDLL(PREFIX + "/lib/libGL.dylib", mode=ctypes.RTLD_GLOBAL)
+images = loaded_images()
+if OPENGL_FRAMEWORK not in images:
+    fail("Apple's OpenGL framework is not in the process")
+if APPLE_LIBGL not in images:
+    fail("Apple's libGL.dylib was substituted out of the search path")
+mesa = [path for path in images
+        if path.endswith("/libGL.dylib") and not path.startswith(FRAMEWORK)]
+if not mesa:
+    fail("Mesa's libGL.dylib is not in the process")
+print("apple libGL.dylib: present, not substituted")
+print("mesa libGL: " + mesa[0])
+print("both libGL images coexist")
+for name in SHIM_NAMES:
+    try:
+        ctypes.CDLL(SHIM + "/" + name, mode=ctypes.RTLD_GLOBAL)
+    except OSError as failure:
+        fail(name + ": " + str(failure).splitlines()[0])
+    print(name + ": loaded")
+
+# The shim the way LWJGL resolves it: it joins the file name to each path its
+# JvmArgs name, then hands that path to dyld. These paths come out of the written
+# instance.cfg, so this fails when the properties never reached the config.
+for directory in LIBRARY_DIRS:
+    for name in SHIM_NAMES:
+        target = directory + "/" + name
+        if not os.path.isfile(target):
+            fail("lwjgl resolution: " + target + " does not exist")
+        try:
+            ctypes.CDLL(target, mode=ctypes.RTLD_GLOBAL)
+        except OSError as failure:
+            fail("lwjgl resolution of " + target + ": " + str(failure).splitlines()[0])
+        if target not in loaded_images():
+            fail("lwjgl resolution: dyld loaded another image for " + target)
+    print("lwjgl resolution: " + ", ".join(SHIM_NAMES) + " resolved via " + directory)
+"""
+
+
+def moltenvr_shim_dir():
+    """Where MoltenVR drops its OpenVR shim; absent until VR is enabled once."""
+    return os.path.expanduser("~/.moltenvr")
+
+
+def require_moltenvr_shim(line):
+    """MoltenVR's shim directory, proved to hold the library before it is named.
+
+    LWJGL searches only the paths these flags give it, so a directory with no
+    library in it is written into instance.cfg as a path that cannot resolve,
+    and the launch then fails as "Failed to locate library", far from the cause.
+    """
+    shim_dir = moltenvr_shim_dir()
+    shim_lib = os.path.join(shim_dir, MOLTENVR_SHIM_LIB)
+    if not os.path.isfile(shim_lib):
+        raise PhaseError(shim_lib + " not found — install MoltenVR, open it once, "
+                         "press \"Enable VR\" on this instance, then run glmtlmc again")
+    line.report("present", MOLTENVR_SHIM_LIB)
+    # The binding is a second image in the same directory and "Enable VR" writes
+    # both, so one without the other means a half-run step, not a broken install.
+    lwjgl_lib = os.path.join(shim_dir, MOLTENVR_LWJGL_LIB)
+    if not os.path.isfile(lwjgl_lib):
+        raise PhaseError(lwjgl_lib + " not found — " + MOLTENVR_LWJGL_LIB + " is the LWJGL "
+                         "OpenVR binding beside the shim, and \"Enable VR\" writes both; "
+                         "press it on this instance, then run glmtlmc again")
+    line.report("present", MOLTENVR_LWJGL_LIB)
+    if " " in shim_dir:
+        raise PhaseError("glmtlmc requires a space-free shim path (current: " + shim_dir + ")")
+    return shim_dir
+
+
+def with_moltenvr_flags(present_flags, shim_dir):
+    """present_flags plus whichever of MoltenVR's three flags are missing.
+
+    "Enable VR" is MoltenVR's own step and never guaranteed to have run on this
+    instance, so glmtlmc adds what is absent rather than only preserving. A flag
+    already present keeps its own value: it may name a shim the user built.
+    """
+    flags = list(present_flags)
+    defaults = [prefix + shim_dir for prefix in MOLTENVR_PATH_FLAGS] + [MOLTENVR_ZGC_FLAG]
+    for prefix, flag in zip(MOLTENVR_JVM_FLAGS, defaults):
+        if not any(existing.startswith(prefix) for existing in flags):
+            flags.append(flag)
+    return flags
+
+
+def moltenvr_library_dirs(tokens):
+    """The directories a tokenised JvmArgs hands LWJGL for native library lookup."""
+    return [token.partition("=")[2] for token in tokens
+            if token.startswith(MOLTENVR_PATH_FLAGS)]
+
+
+def moltenvr_app_version():
+    """MoltenVR's bundle version, parsed out of Info.plist; None if unreadable.
+
+    plistlib, not a grep: the value is one field in a plist that may be binary,
+    and an absent bundle or a truncated file must both answer None instead of
+    raising — the shim above is what the launch actually loads.
+    """
+    plist_path = os.path.join(MOLTENVR_APP, "Contents", "Info.plist")
+    try:
+        with open(plist_path, "rb") as handle:
+            bundle = plistlib.load(handle)
+    except (OSError, ValueError, ExpatError):
+        return None
+    if not isinstance(bundle, dict):
+        return None
+    return dotted_version(str(bundle.get("CFBundleShortVersionString", "")))
+
+
+def report_moltenvr_install(line):
+    """MoltenVR's own bundle, as far as the filesystem can prove it.
+
+    Informational only. The shim is what the launch resolves, so an absent app, an
+    unreadable plist, or a version older than MC 26.x needs is worth saying out
+    loud and worth no halt on its own.
+    """
+    if not os.path.isdir(MOLTENVR_APP):
+        line.detail("no MoltenVR.app in /Applications — the shim in " + moltenvr_shim_dir()
+                    + " is what this needs, so patching continues")
+        return
+    version = moltenvr_app_version()
+    if version is None:
+        line.report("found", MOLTENVR_APP + " (its Info.plist version could not be read)")
+        return
+    line.report("found", "MoltenVR " + dotted_text(version) + " (" + MOLTENVR_APP + ")")
+    if version < MOLTENVR_MIN_VERSION:
+        line.detail("MoltenVR " + dotted_text(version) + " predates MC " + MINECRAFT_VERSION
+                    + ": " + dotted_text(MOLTENVR_MIN_VERSION) + " or newer is required for the "
+                    "LWJGL 3.4.1 dual librarypath install those versions ship with")
+
+
+def run_vr_collision_probe(prefix, icd_path, search_dir, library_dirs):
+    """Apple's OpenGL framework and Mesa's libGL must both survive one search
+    path, and MoltenVR's shim must load once they do — its CGL symbols exist
+    only in Apple's, which dyld substitutes away if the search path holds a
+    libGL.dylib. library_dirs are the paths LWJGL would resolve the shim through."""
+    snippet = VR_PROBE_CODE.replace("__PREFIX__", prefix)
+    snippet = snippet.replace("__SHIM__", moltenvr_shim_dir())
+    snippet = snippet.replace("__LIBRARY_DIRS__", repr(list(library_dirs)))
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", snippet],
+            env=probe_environment(prefix, icd_path, search_dir),
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise PhaseError("VR collision probe timed out after 20 seconds")
     if completed.returncode != 0:
         stderr = completed.stderr.strip()
         raise PhaseError(stderr if stderr
@@ -451,11 +1001,11 @@ def configure_mesa(line, stack):
     dri_dir = os.path.join(prefix, "lib", "dri")
     if not os.path.isdir(dri_dir) or not os.listdir(dri_dir):
         raise PhaseError(dri_dir + " not found or empty")
-    line.detail(prefix)
+    line.report("stack", prefix)
 
 
 def configure_kosmickrisp(line, stack):
-    line.detail(stack["icd_path"] + " (api_version " + stack["icd_api_version"] + ")")
+    line.report("icd", stack["icd_path"] + " (api_version " + stack["icd_api_version"] + ")")
 
 
 def link_translation_layer(line, script_dir, stack):
@@ -466,23 +1016,168 @@ def link_translation_layer(line, script_dir, stack):
         raise PhaseError("glmtlmc requires a space-free path (current: " + glfw_path + ")")
     if not is_macho(glfw_path):
         raise PhaseError("not a Mach-O dylib: " + glfw_path)
-    line.detail(glfw_path)
+    line.report("glfw", os.path.relpath(glfw_path, script_dir))
     stack["glfw_path"] = glfw_path
 
 
+def instance_mods_dir(instance_dir):
+    """Prism's mods folder for an instance; absent until the first mod install."""
+    return os.path.join(instance_dir, "minecraft", "mods")
+
+
+def mod_jar_names(mods_dir):
+    """Jar names in mods_dir, or none at all when the folder cannot be read.
+
+    A missing or unreadable folder is not a failure: an instance may never have
+    had a mod, and detection must not be able to stop a patch.
+    """
+    try:
+        names = os.listdir(mods_dir)
+    except OSError:
+        return []
+    return [name for name in sorted(names) if name.lower().endswith(".jar")]
+
+
+def dotted_version(text):
+    """(major, minor, patch) for the first version in text; None when it has none.
+
+    Also parses jar names, where the mod's own release is the first three-part run
+    of digits: the Minecraft version that trails it is two parts
+    (iris-fabric-1.11.4+26.2-fabric). A shorter run compares as the older release
+    it is, which is the answer both callers want.
+    """
+    runs = DOTTED_VERSION.findall(text)
+    if not runs:
+        return None
+    run = next((candidate for candidate in runs if candidate.count(".") == 2), runs[0])
+    return tuple(int(piece) for piece in run.split("."))
+
+
+def dotted_text(version):
+    """The version as written, for a message that has to name it."""
+    return ".".join(str(part) for part in version)
+
+
+def find_mod_jars(mods_dir, mod_name):
+    """(file name, version) for every jar of mod_name itself, oldest name first.
+
+    The name has to be the mod's, and the segment after it must be a loader word
+    or the version itself: otherwise the match is some other mod that merely
+    shares the prefix, because sodium-extra is not Sodium.
+    """
+    jars = []
+    for name in mod_jar_names(mods_dir):
+        stem = name[:-4].lower()
+        if not stem.startswith(mod_name):
+            continue
+        rest = stem[len(mod_name):]
+        if rest and rest[0] not in "-_":
+            continue
+        head = rest.lstrip("-_").replace("_", "-").split("-")[0]
+        if head and head not in MOD_LOADER_WORDS and head[0] not in DECIMAL_DIGITS:
+            continue
+        jars.append((name, dotted_version(stem)))
+    return jars
+
+
+def newest_mod_jar(jars):
+    """The (file name, version) with the highest version in a find_mod_jars result.
+
+    Fabric loads the highest jar present, so an older copy left in mods/ must not
+    be the one that decides whether the shaders work.
+    """
+    return max(jars, key=lambda jar: jar[1])
+
+
+def mod_jar_text(jar):
+    """"<version> (<file name>)" for one find_mod_jars result."""
+    filename, version = jar
+    return dotted_text(version) + " (" + filename + ")" if version else filename
+
+
+def injected_vr_libraries(line, content, stack):
+    """The extra dylibs to insert after libgl_interpose.dylib, in order.
+
+    A plain patch preserves what the instance already injects and never adds one:
+    an instance that never carried the VR fix must stay byte-identical. A VR patch
+    always points at the vr-lib copy it just built and measured, so an entry left
+    over from another stack cannot hand dyld a library glmtlmc never checked.
+    """
+    preserved = preserved_vr_glfix(content)
+    if stack.get("shim_dir") is None:
+        return (preserved,) if preserved else ()
+    local = os.path.join(stack_search_dir(stack), VR_GL_FIX_LIB)
+    if preserved is not None and preserved != local:
+        line.report("repointed", local + " (was " + preserved + ")")
+    return (local,)
+
+
+def inspect_shader_mods(line, instance_dir):
+    """Iris and Sodium as this instance has them, before anything is written.
+
+    Iris 1.11.3 reworked how it builds shader programs and the result in VR is a
+    broken image in each eye view (IrisShaders/Iris issue #3373), which reads as a
+    broken headset rather than as a shader bug, so the mismatch has to stop the
+    run here instead of costing the user one.
+    """
+    mods_dir = instance_mods_dir(instance_dir)
+    sodium = find_mod_jars(mods_dir, "sodium")
+    if sodium:
+        line.detail("Sodium " + mod_jar_text(newest_mod_jar(sodium)) + " — Iris "
+                    + dotted_text(IRIS_SHADER_SAFE_VERSION) + " pairs with Sodium 0.9.1")
+    iris = find_mod_jars(mods_dir, "iris")
+    if not iris:
+        line.detail("no Iris in " + mods_dir + " — VR runs, but no shaderpack can load")
+        return
+    for filename, version in iris:
+        if version is not None:
+            continue
+        raise PhaseError("cannot read the Iris version in " + filename + " — VR needs Iris "
+                         + dotted_text(IRIS_SHADER_SAFE_VERSION) + " or lower, so install that "
+                         "version or rename the file to its usual form")
+    newest = newest_mod_jar(iris)
+    if newest[1] >= IRIS_SHADER_BREAK_VERSION:
+        raise PhaseError(newest[0] + " is Iris " + dotted_text(newest[1]) + ": Iris "
+                         + dotted_text(IRIS_SHADER_BREAK_VERSION) + " and newer break shaders "
+                         "in the VR eye views (" + IRIS_ISSUE + ") — install Iris "
+                         + dotted_text(IRIS_SHADER_SAFE_VERSION) + " or lower for VR")
+    line.detail("Iris " + mod_jar_text(newest) + " — "
+                + dotted_text(IRIS_SHADER_SAFE_VERSION) + " or lower, shaders keep working in VR")
+
+
+def back_up_config(line, instance_dir, content):
+    """Copy the config aside before a first patch, so unpatch has something to
+    restore; a config glmtlmc already wrote is the backup of record."""
+    if is_already_patched(content):
+        line.detail("already patched, so the config on disk is the backup of record")
+        return
+    name = BACKUP_PREFIX + datetime.now().strftime(BACKUP_STAMP)
+    with open(os.path.join(instance_dir, name), "wb") as handle:
+        handle.write(content)
+    line.report("backed up", name)
+
+
 def configure_custom_arguments(line, instance_dir, stack):
-    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"])
     cfg_path = os.path.join(instance_dir, "instance.cfg")
     content = read_file_bytes(cfg_path)
-    if not is_already_patched(content):
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        with open(os.path.join(instance_dir, "instance.cfg.glmtlmc.bak-" + stamp), "wb") as handle:
-            handle.write(content)
-    write_atomically(cfg_path, upsert_ini_keys(content, values))
+    preserved = moltenvr_jvm_flags(content)
+    shim_dir = stack.get("shim_dir")
+    if shim_dir is not None:
+        preserved = with_moltenvr_flags(preserved, shim_dir)
+    stack["preserved_jvm_flags"] = preserved
+    stack["injected_libraries"] = injected_vr_libraries(line, content, stack)
+    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"],
+                                stack_search_dir(stack), preserved, stack["injected_libraries"])
+    back_up_config(line, instance_dir, content)
+    for verb, detail in set_verdicts(general_key_values(content), values):
+        line.report(verb, detail)
+    write_atomically(line, cfg_path, upsert_ini_keys(content, values))
 
 
 def verify_startup(line, instance_dir, stack):
-    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"])
+    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"],
+                                stack_search_dir(stack), stack["preserved_jvm_flags"],
+                                stack["injected_libraries"])
     current = dict(iter_key_values(read_file_bytes(os.path.join(instance_dir, "instance.cfg"))))
     for key, expected in values.items():
         if current.get(key) != expected:
@@ -490,7 +1185,224 @@ def verify_startup(line, instance_dir, stack):
     for path in stack_paths(stack):
         if not os.path.exists(path):
             raise PhaseError(path + " not found")
-    line.detail("instance.cfg verified, all stack paths exist")
+    line.report("checked", "instance.cfg holds the " + str(len(STACK_KEYS))
+                + " stack keys and every stack path exists")
+
+
+def prepare_vr_search_path(line, stack):
+    """Mirror lib/ into vr-lib so DYLD_LIBRARY_PATH stops shadowing Apple's libGL,
+    and pin MoltenVR's shim location for LWJGL to resolve the OpenVR library in.
+
+    The shim is checked first: a missing one must fail before the config is
+    written, not leave a JvmArgs pointing at a path with no library in it.
+    """
+    shim_dir = require_moltenvr_shim(line)
+    line.report("found", shim_dir)
+    report_moltenvr_install(line)
+    prefix = stack["prefix"]
+    vr_dir = prepare_vr_search_dir(line, prefix)
+    for name, reason in vr_link_skips(prefix):
+        line.report("left out", name + " (" + reason + ")")
+    placed = []
+    kept = 0
+    for name in vr_link_names(prefix):
+        note = link_vr_lib_entry(vr_dir, name)
+        if note is None:
+            kept += 1
+            continue
+        line.report(note[0], note[1])
+        placed.append(note[0])
+    line.detail(link_summary(placed, kept))
+    stack["search_dir"] = vr_dir
+    stack["shim_dir"] = shim_dir
+
+
+def find_vr_glfix_source(script_dir):
+    """vr_glfix.c from the repository the script ships in; None when it is absent."""
+    for candidate in (os.path.join(script_dir, "scripts", VR_GL_FIX_SOURCE),
+                      os.path.join(script_dir, "..", "scripts", VR_GL_FIX_SOURCE)):
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def compile_vr_glfix(source, destination):
+    """Build vr_glfix.c into destination; returns the compiler's warnings.
+
+    OpenGL.framework has to be linked or dyld rejects the interpose tuples, and
+    the result has to be signed or nothing will load it at all, so both ride in
+    the one command rather than being left to the caller to remember.
+    """
+    command = ["xcrun", "clang", "-arch", "arm64", "-O2", "-Wall", "-Wextra", "-dynamiclib",
+               "-install_name", "@rpath/" + VR_GL_FIX_LIB, "-framework", "OpenGL",
+               source, "-o", destination]
+    completed = run_tool(command, BUILD_TIMEOUT)
+    if completed.returncode != 0:
+        raise PhaseError("clang failed on " + source + " — "
+                         + (completed.stderr.strip() or str(completed.returncode)))
+    return [row for row in completed.stderr.splitlines() if row.strip()]
+
+
+def sign_dylib(path):
+    """Ad-hoc sign, which is what a dylib in the user's own stack needs to load."""
+    completed = run_tool(["codesign", "--force", "--sign", "-", path])
+    if completed.returncode != 0:
+        raise PhaseError("codesign failed on " + path + " — "
+                         + (completed.stderr.strip() or str(completed.returncode)))
+
+
+def collapsed_or_wrong_table(size):
+    """What an __interpose table of this size means, in words the user can act on.
+
+    One tuple is the silent case: every trampoline took the name of the symbol it
+    displaces, so each tuple is {self, self} and the library redirects nothing.
+    """
+    if size == INTERPOSE_TUPLE_BYTES:
+        return ("one tuple is what a build emits when every trampoline took the name of the "
+                "symbol it displaces, so the table loads and redirects nothing")
+    return "the table is not the redirections the shim's imports need, so nothing is redirected"
+
+
+def verify_vr_glfix(line, path):
+    """Prove a libvr_glfix.dylib really redirects, before anything can load it.
+
+    A build whose trampolines took the displaced symbols' own names produces a
+    library that loads cleanly and does nothing at all, which is the failure
+    these four checks keep out of a user's VR stack.
+    """
+    size = interpose_section_size(path)
+    if size != VR_GL_FIX_INTERPOSE_BYTES:
+        raise PhaseError(path + " has a " + str(size) + "-byte __interpose table, not "
+                         + str(VR_GL_FIX_INTERPOSE_BYTES) + " (" + str(VR_GL_FIX_REDIRECTS)
+                         + " tuples x 16) — " + collapsed_or_wrong_table(size))
+    symbols = nm_symbols(path)
+    redirects = [name for name, kind in symbols.items()
+                 if kind == "T" and name.startswith("_redirect_gl")]
+    if len(redirects) != VR_GL_FIX_REDIRECTS:
+        raise PhaseError(path + " defines " + str(len(redirects)) + " redirect_gl* functions, "
+                         "not " + str(VR_GL_FIX_REDIRECTS) + " — the shim's GL imports would "
+                         "go unbound and segfault without a redirect")
+    line.report("checked", "interpose table " + str(size) + " bytes, "
+                + str(len(redirects)) + " redirects")
+    cgl = [name for name, kind in symbols.items() if kind == "U" and name.startswith("_CGL")]
+    if cgl:
+        raise PhaseError(path + " binds " + ", ".join(sorted(cgl)) + " — Apple's CGL symbols "
+                         "have to stay bound to the OpenGL framework, or the shim cannot "
+                         "take the fallback path this library exists to make survivable")
+    line.report("checked", "no Apple CGL symbols bound")
+    if not is_code_signed(path):
+        raise PhaseError(path + " is not code-signed — dyld will not load it")
+    line.report("checked", "code signature present")
+
+
+def install_vr_glfix(built, installed):
+    """Put a verified build in place; the swap is atomic, so the path a launch
+    would use is never a half-written dylib."""
+    staged = installed + TEMP_SUFFIX
+    shutil.copy2(built, staged)
+    os.replace(staged, installed)
+
+
+def deploy_vr_glfix(line, script_dir, stack):
+    """The VR GL interposer, proved before it can reach the VR search path.
+
+    libvr_glfix.dylib is the only thing between MoltenVR's shim and a null-CGL
+    SIGSEGV, and a misbuilt one loads cleanly and does nothing, so it is compiled
+    in a temporary directory, measured there, and only then copied into vr-lib.
+    A failed build leaves nothing behind for the next run to find and trust.
+    """
+    vr_dir = stack["search_dir"]
+    installed = os.path.join(vr_dir, VR_GL_FIX_LIB)
+    if os.path.isfile(installed):
+        try:
+            verify_vr_glfix(line, installed)
+        except PhaseError as broken:
+            line.report("replacing", installed)
+            line.detail(str(broken))
+        else:
+            line.report("kept", installed)
+            return
+    source = find_vr_glfix_source(script_dir)
+    if source is None:
+        raise PhaseError(VR_GL_FIX_SOURCE + " not found beside glmtlmc — VR patching builds "
+                         + VR_GL_FIX_LIB + " from it")
+    line.report("source", os.path.relpath(source, script_dir))
+    build_dir = tempfile.mkdtemp(prefix=TEMP_BUILD_PREFIX)
+    line.report("staged", build_dir)
+    try:
+        built = os.path.join(build_dir, VR_GL_FIX_LIB)
+        for warning in compile_vr_glfix(source, built):
+            line.detail("clang: " + warning)
+        line.report("built", VR_GL_FIX_LIB)
+        sign_dylib(built)
+        line.report("signed", VR_GL_FIX_LIB + " (ad-hoc)")
+        verify_vr_glfix(line, built)
+        install_vr_glfix(built, installed)
+        line.report("installed", installed)
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
+        if os.path.isdir(build_dir):
+            line.detail("could not remove " + build_dir)
+        else:
+            line.report("removed", build_dir)
+
+
+def verify_moltenvr_flags(line, content):
+    """The written JvmArgs, checked for the flags LWJGL resolves a library by.
+
+    Reads instance.cfg back rather than re-deriving the value, so a write that
+    lost or garbled a flag is caught here and not at launch as LWJGL's "Failed
+    to locate library". Returns the library paths the flags name.
+    """
+    tokens = jvm_arg_tokens(content)
+    for prefix in MOLTENVR_JVM_FLAGS:
+        if not any(token.startswith(prefix) for token in tokens):
+            raise PhaseError("JvmArgs lost " + prefix + " — LWJGL would search no path")
+    library_dirs = moltenvr_library_dirs(tokens)
+    for library_dir in library_dirs:
+        shim_lib = os.path.join(library_dir, MOLTENVR_SHIM_LIB)
+        if not os.path.isfile(shim_lib):
+            raise PhaseError(shim_lib + " not found — JvmArgs points LWJGL at it")
+    line.report("checked", "JvmArgs carries all " + str(len(MOLTENVR_JVM_FLAGS))
+                + " MoltenVR flags, shim present in " + " and ".join(library_dirs))
+    return library_dirs
+
+
+def verify_vr_library_path(line, content, stack):
+    """DYLD_LIBRARY_PATH must name vr-lib, and vr-lib must stay free of the two
+    images dyld would substitute for a system one.
+
+    libGL.dylib in that path shadows Apple's, which is what costs MoltenVR the
+    CGL symbols its shim links against.
+    """
+    search_dir = dict(wrapper_env_pairs(content)).get("DYLD_LIBRARY_PATH")
+    if search_dir != stack["search_dir"]:
+        raise PhaseError("DYLD_LIBRARY_PATH is " + str(search_dir) + ", expected "
+                         + stack["search_dir"])
+    if os.path.basename(search_dir) != VR_LIB_NAME:
+        raise PhaseError("DYLD_LIBRARY_PATH must name the " + VR_LIB_NAME
+                         + " directory, not " + search_dir)
+    shadowing = [name for name in os.listdir(search_dir) if vr_search_exclusion(name)]
+    if shadowing:
+        raise PhaseError(search_dir + " must not carry " + ", ".join(sorted(shadowing))
+                         + " — dyld would substitute it for the system image")
+    line.report("checked", "DYLD_LIBRARY_PATH is " + search_dir
+                + ", carrying no libGL.dylib and no libglfw")
+
+
+def verify_vr_startup(line, instance_dir, stack):
+    """Mesa must still reach GL 4.6 through vr-lib, the config must tell LWJGL
+    where MoltenVR's shim is, and that shim must load beside Mesa — the three
+    ways this search dir has already failed."""
+    prefix = stack["prefix"]
+    for report_line in run_translation_probe(prefix, stack["icd_path"], stack["search_dir"]):
+        line.detail(report_line)
+    content = read_file_bytes(os.path.join(instance_dir, "instance.cfg"))
+    library_dirs = verify_moltenvr_flags(line, content)
+    verify_vr_library_path(line, content, stack)
+    for report_line in run_vr_collision_probe(prefix, stack["icd_path"],
+                                              stack["search_dir"], library_dirs):
+        line.detail(report_line)
 
 
 def do_nothing(line):
@@ -504,18 +1416,22 @@ def verify_instance_state(line, instance_dir):
 
 
 def locate_backup(line, instance_dir, state):
-    backups = glob.glob(os.path.join(instance_dir, "instance.cfg.glmtlmc.bak-*"))
+    backups = glob.glob(os.path.join(instance_dir, BACKUP_PREFIX + "*"))
     if not backups:
         raise PhaseError("no backup found — cannot restore automatically")
     state["backup_path"] = max(backups)
-    line.detail(os.path.basename(state["backup_path"]))
+    line.report("found", state["backup_path"])
 
 
 def restore_configuration(line, instance_dir, state):
+    """Put the 4 stack keys back from the backup, so a vr-lib WrapperCommand goes
+    with them. vr-lib itself is left on disk: it is inert and rebuilt on demand."""
     cfg_path = os.path.join(instance_dir, "instance.cfg")
     backup_content = read_file_bytes(state["backup_path"])
     current_content = read_file_bytes(cfg_path)
-    write_atomically(cfg_path, restore_ini_keys(current_content, backup_content))
+    for verb, detail in restore_verdicts(current_content, backup_content):
+        line.report(verb, detail)
+    write_atomically(line, cfg_path, restore_ini_keys(current_content, backup_content))
 
 
 def verify_vanilla_startup(line, instance_dir, state):
@@ -525,6 +1441,7 @@ def verify_vanilla_startup(line, instance_dir, state):
     for key in STACK_KEYS:
         if current.get(key) != backup.get(key):
             raise PhaseError(key + " does not match the backup state")
+    line.report("checked", "every stack key matches the backup")
 
 
 def patch_phases(instance_dir, script_dir):
@@ -543,6 +1460,26 @@ def patch_phases(instance_dir, script_dir):
     ]
 
 
+def patch_vr_phases(instance_dir, script_dir):
+    stack = {}
+    return [
+        ("Verifying hardware compatibility", lambda line: verify_hardware(line)),
+        ("Verifying instance version", lambda line: verify_instance_version(line, instance_dir)),
+        ("Getting report from Translation Layer", lambda line: probe_report(line, script_dir, stack)),
+        ("Configuring MESA", lambda line: configure_mesa(line, stack)),
+        ("Configuring KosmikKrisp", lambda line: configure_kosmickrisp(line, stack)),
+        ("Linking Translation Layer", lambda line: link_translation_layer(line, script_dir, stack)),
+        ("Checking shader mods", lambda line: inspect_shader_mods(line, instance_dir)),
+        ("Preparing VR search path", lambda line: prepare_vr_search_path(line, stack)),
+        ("Building VR GL fix", lambda line: deploy_vr_glfix(line, script_dir, stack)),
+        ("Configuring Custom Arguments", lambda line: configure_custom_arguments(line, instance_dir, stack)),
+        ("Verifying instance startup", lambda line: verify_startup(line, instance_dir, stack)),
+        ("Verifying VR startup", lambda line: verify_vr_startup(line, instance_dir, stack)),
+        ("Cleaning up", do_nothing),
+        ("Finalizing", do_nothing),
+    ]
+
+
 def unpatch_phases(instance_dir):
     state = {}
     return [
@@ -556,6 +1493,12 @@ def unpatch_phases(instance_dir):
 
 
 def run_operation(phases):
+    """Run the phases in order; 1 if one failed, stopping at the first.
+
+    Nothing is printed after the last phase: every phase already printed its own
+    rows, and a run that reaches the end without an error row has said all there
+    is to say.
+    """
     for title, action in phases:
         line = PhaseLine(title)
         try:
@@ -563,19 +1506,7 @@ def run_operation(phases):
         except (PhaseError, OSError) as failure:
             line.fail(str(failure))
             return 1
-        line.done()
     return 0
-
-
-def print_finish(started, error_count):
-    elapsed = time.monotonic() - started
-    seconds = int(elapsed)
-    milliseconds = int((elapsed - seconds) * 1000)
-    print("Finished in " + str(seconds) + ":" + str(milliseconds))
-    if error_count:
-        print(RED + "Errors: " + str(error_count) + RESET)
-    else:
-        print(GREEN + "No errors" + RESET)
 
 
 def ensure_inside_project():
@@ -627,6 +1558,7 @@ def ask_operation():
     print("1 : Patch")
     print("2 : Unpatch")
     print("3 : Update glmtlmc")
+    print("4 : Patch + VR (MoltenVR)")
     try:
         choice = input().strip().lower()
     except EOFError:
@@ -637,6 +1569,8 @@ def ask_operation():
         return "unpatch"
     if choice in ("3", "update"):
         return "patch"
+    if choice in ("4", "vr"):
+        return "patch-vr"
     print(RED + "Error: unknown choice" + RESET)
     sys.exit(1)
 
@@ -648,12 +1582,12 @@ def main():
     operation = ask_operation()
     if operation == "unpatch":
         phases = unpatch_phases(instance_dir)
+    elif operation == "patch-vr":
+        phases = patch_vr_phases(instance_dir, script_dir)
     else:
         phases = patch_phases(instance_dir, script_dir)
     dequarantine(script_dir)
-    started = time.monotonic()
     error_count = run_operation(phases)
-    print_finish(started, error_count)
     sys.exit(1 if error_count else 0)
 
 
@@ -676,8 +1610,6 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        if ACTIVE_LINE is not None:
-            ACTIVE_LINE._wind_down()
         print()
         sys.exit(130)
     finally:

@@ -28,7 +28,7 @@ Validated shaderpack compatibility, including Complementary Reimagined, with kno
 
 *Complementary Reimagined local patcher*
 
-An optional tool in `shader-tools/ComplementaryPatch` downloads Complementary Reimagined r5.9.3 from Modrinth, applies the included Apple-device-gating patch, and writes the patched pack to `dist/ComplementaryReimagined_r5.9.3.zip`. Run `./build.sh` in that directory if you want the patched version. Why can we not ship it? Licensing. We abide by licenses. This patcher does basically the same thing but on your device.
+An optional tool in `shaders/ComplementaryPatch` downloads Complementary Reimagined r5.9.3 from Modrinth, applies the included Apple-device-gating patch, and writes the patched pack to `dist/ComplementaryReimagined_r5.9.3.zip`. Run `./build.sh` in that directory if you want the patched version. Why can we not ship it? Licensing. We abide by licenses. This patcher does basically the same thing but on your device.
 
 *Contributing*
 
