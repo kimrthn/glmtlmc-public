@@ -158,7 +158,7 @@ Based on the https://gist.github.com/lucamignatti/5312f5e937de2ba44256ecba6de54c
 [issues-url]: https://discord.gg/zBMcGPRgB5
 [product-screenshot]: https://github.com/user-attachments/assets/7e57feb2-cd9b-408b-9ec4-01e9c5caf934
 [OpenGL]: https://img.shields.io/badge/OpenGl-5487A6?logo=OpenGl&logoColor=white
-[OpenGL-url]: https://nextjs.org/
+[OpenGL-url]: https://www.opengl.org/
 [KosmikKrisp]: https://camo.githubusercontent.com/9b5f86854a9ca76796f773c2c21fc3dbe61d9c89d499ee64b37a93875dd2a37c/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4b6f736d69634b726973702d4d6573612532306472697665722d364134433933
 [KosmikKrisp-url]: https://docs.mesa3d.org/drivers/kosmickrisp.html
 [Mesa]: https://camo.githubusercontent.com/963cf9a770167be3c2d3aaa6cd3316d83d36c4daa6dbf257b3d43c0fea218a22/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f4d6573612d4772617068696373253230737461636b2d334138303642
