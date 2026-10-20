@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import plistlib
+import pwd
 import re
 import shutil
 import struct
@@ -50,6 +51,7 @@ BACKUP_STAMP = "%Y%m%d-%H%M%S"
 TEMP_SUFFIX = ".glmtlmc.tmp"
 TEMP_BUILD_PREFIX = "glmtlmc-vr-glfix-"
 QUARANTINE_ATTR = "com.apple.quarantine"
+PRISM_DATA_DIR = "~/Library/Application Support/PrismLauncher"
 
 MH_MAGIC_64 = 0xFEEDFACF
 FAT_MAGIC_BYTES = b"\xca\xfe\xba\xbe"
@@ -455,21 +457,31 @@ def dequarantine(script_dir):
 
     Undoing a quarantine edits the extended attributes of every file it touches,
     so it is reported the same way as a write even though nothing was rewritten.
+    xattr fails silently on files it may not touch, so the count is taken again
+    afterwards: any library left quarantined is one Gatekeeper blocks at launch.
     """
     cleared = []
+    remaining = 0
     for folder in ("stack", "shaderpacks"):
         target = os.path.join(script_dir, folder)
         if not os.path.isdir(target):
             continue
-        cleared.append((folder, quarantined_count(target)))
+        before = quarantined_count(target)
         subprocess.run(
             ["xattr", "-dr", QUARANTINE_ATTR, target],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        after = quarantined_count(target)
+        cleared.append((folder, before - after))
+        remaining += after
     if not cleared:
         return
     line = PhaseLine("Clearing quarantine")
     for folder, count in cleared:
         line.report("cleared", folder + " (" + plural(count, "file") + ")")
+    if remaining:
+        line.fail(plural(remaining, "file") + " still quarantined — run again with "
+                  "sudo: sudo " + os.path.join(script_dir, "glmtlmc"))
+        sys.exit(1)
 
 
 def run_tool(command, timeout=None):
@@ -981,16 +993,20 @@ def verify_hardware(line):
         raise PhaseError("this stack requires Apple Silicon macOS")
 
 
-def verify_instance_version(line, instance_dir):
+def instance_minecraft_version(instance_dir):
+    """The Minecraft version mmc-pack.json pins, or None if it names none."""
     pack_path = os.path.join(instance_dir, "mmc-pack.json")
     with open(pack_path, "r", encoding="utf-8") as handle:
         pack = json.load(handle)
     components = pack.get("components", []) if isinstance(pack, dict) else []
-    version = None
     for component in components:
         if isinstance(component, dict) and component.get("uid") == "net.minecraft":
-            version = component.get("version") or component.get("cachedVersion")
-            break
+            return component.get("version") or component.get("cachedVersion")
+    return None
+
+
+def verify_instance_version(line, instance_dir):
+    version = instance_minecraft_version(instance_dir)
     if version != MINECRAFT_VERSION:
         raise PhaseError("instance is " + str(version or "missing")
                          + ", expected " + MINECRAFT_VERSION)
@@ -1012,6 +1028,12 @@ def refuse_duplicate_mods(line, instance_dir):
 
 def probe_report(line, script_dir, stack):
     prefix = resolve_mesa_prefix(script_dir)
+    # Every stack path lands in JvmArgs and WrapperCommand, which are split on
+    # spaces, so one space or backslash turns a path into two broken arguments.
+    if any(char.isspace() or char == "\\" for char in prefix):
+        raise PhaseError("glmtlmc requires a stack path without spaces or backslashes "
+                         "(current: " + prefix + ") — move the glmtlmc folder, "
+                         "e.g. to ~/glmtlmc, then run it again")
     egl_path = os.path.join(prefix, "lib", "libEGL.dylib")
     if not os.path.isfile(egl_path):
         raise PhaseError(egl_path + " not found (set GLMTLMC_MESA_PREFIX)")
@@ -1547,6 +1569,28 @@ def run_operation(phases):
     return 0
 
 
+def drop_sudo():
+    """Hand the run back to the user who typed sudo, once quarantine is cleared.
+
+    Clearing quarantine is the only step that may need root. Everything after it
+    writes into the user's Prism instance and the stack, and Prism, Minecraft and
+    a re-run of glmtlmc all need to own those files, so none of them can be root's.
+    """
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    if not sudo_uid:
+        print(RED + "Error: run glmtlmc from your own account with sudo, not as root"
+              + RESET)
+        sys.exit(1)
+    user = pwd.getpwuid(int(sudo_uid))
+    os.initgroups(user.pw_name, user.pw_gid)
+    os.setgid(user.pw_gid)
+    os.setuid(user.pw_uid)
+    os.environ.update({"HOME": user.pw_dir, "USER": user.pw_name,
+                       "LOGNAME": user.pw_name})
+
+
 def ensure_inside_project():
     """Signature-check the folder around the script, then work from inside it.
 
@@ -1574,14 +1618,88 @@ def refuse_if_launcher_running():
             sys.exit(1)
 
 
+def prism_instance_roots():
+    """Prism's instances folder: the default, or wherever its settings moved it.
+
+    InstanceDir is relative to Prism's data folder unless the user picked an
+    absolute one, and it is absent from prismlauncher.cfg until changed.
+    """
+    data_dir = os.path.expanduser(PRISM_DATA_DIR)
+    instance_dir = "instances"
+    try:
+        settings = read_file_bytes(os.path.join(data_dir, "prismlauncher.cfg"))
+    except OSError:
+        settings = b""
+    for key, value in iter_key_values(settings):
+        if key.strip() == "InstanceDir" and value.strip():
+            instance_dir = strip_surrounding_quotes(value.strip())
+    return [os.path.join(data_dir, os.path.expanduser(instance_dir))]
+
+
+def detect_instances():
+    """Every Prism instance on this Mac: (path, name, Minecraft version, patched)."""
+    found = []
+    for root in prism_instance_roots():
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            path = os.path.join(root, entry)
+            cfg_path = os.path.join(path, "instance.cfg")
+            if not (os.path.isfile(cfg_path)
+                    and os.path.isfile(os.path.join(path, "mmc-pack.json"))):
+                continue
+            try:
+                content = read_file_bytes(cfg_path)
+                version = instance_minecraft_version(path)
+            except (OSError, ValueError):
+                continue
+            name = strip_surrounding_quotes(
+                dict(iter_key_values(content)).get("name", "").strip()) or entry
+            found.append((path, name, version, is_already_patched(content)))
+    return sorted(found, key=lambda instance: instance[1].lower())
+
+
+def instance_label(path, name, version, patched):
+    """One menu row. Prism copies keep the original's name, so the folder is
+    shown whenever it differs, or two copies would read the same."""
+    notes = [version or "unknown version"]
+    if version != MINECRAFT_VERSION:
+        notes.append("needs " + MINECRAFT_VERSION)
+    if patched:
+        notes.append("patched")
+    folder = os.path.basename(path)
+    return (name + " (" + ", ".join(notes) + ")"
+            + ("" if folder == name else " in " + folder))
+
+
 def ask_instance_location():
-    print("Location of the instance?")
+    instances = detect_instances()
+    if instances:
+        print("Instances found:")
+        for number, instance in enumerate(instances, 1):
+            print(INDENT + str(number) + " : " + instance_label(*instance))
+        print("Pick a number, or paste the location of the instance:")
+    else:
+        print("Location of the instance?")
     try:
         raw = input()
     except EOFError:
         print(RED + "Error: no instance location given" + RESET)
         sys.exit(1)
-    path = os.path.expanduser(strip_surrounding_quotes(raw.strip()))
+    choice = raw.strip()
+    if choice.isdigit() and instances:
+        if not 1 <= int(choice) <= len(instances):
+            print(RED + "Error: no instance numbered " + choice + RESET)
+            sys.exit(1)
+        return instances[int(choice) - 1][0]
+    path = strip_surrounding_quotes(choice)
+    # A folder dragged into Terminal arrives shell-escaped ("Application\ Support"),
+    # so a path that is not there as written is tried again with the escapes undone.
+    if "\\" in path and not os.path.isdir(os.path.expanduser(path)):
+        path = re.sub(r"\\(.)", r"\1", path)
+    path = os.path.expanduser(path)
     if not os.path.isdir(path):
         print(RED + "Error: directory not found: " + path + RESET)
         sys.exit(1)
@@ -1615,6 +1733,8 @@ def ask_operation():
 
 def main():
     script_dir = ensure_inside_project()
+    dequarantine(script_dir)
+    drop_sudo()
     refuse_if_launcher_running()
     instance_dir = ask_instance_location()
     operation = ask_operation()
@@ -1624,7 +1744,6 @@ def main():
         phases = patch_vr_phases(instance_dir, script_dir)
     else:
         phases = patch_phases(instance_dir, script_dir)
-    dequarantine(script_dir)
     error_count = run_operation(phases)
     sys.exit(1 if error_count else 0)
 

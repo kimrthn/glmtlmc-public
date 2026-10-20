@@ -95,16 +95,26 @@ Download the latest release file. And save it to a non temporary location for eg
 
 ### Installation
 
-Gatekeeper Fix
-
-1. Open your terminal.
-2. Type 'sudo xattr -cr'
-3. Drag and drop your downloaded GLMTLMC release folder.
-4. Press enter and enter your password;
-
 Quick Start
 
-Run the 'glmtlmc' executable and follow its instructions
+Run glmtlmc with sudo. Browsers quarantine every file they download, and Gatekeeper then blocks each library in the stack when Minecraft loads it. Running with sudo lets glmtlmc clear that quarantine itself before it patches anything. Once it has, it switches back to your own user, so every file it writes stays yours.
+
+1. Quit Prism Launcher completely.
+2. Open your terminal.
+3. Type 'sudo ' (with the space), drag the 'glmtlmc' file from the release folder into the terminal, then press enter and enter your password.
+4. glmtlmc lists the Prism instances it finds, with their Minecraft version and whether they're already patched. Type the number of the one you want. If yours isn't listed, drag the instance folder into the terminal instead and press enter. Escaped spaces like 'Application\ Support' are fine.
+5. Choose an option and follow its instructions.
+
+The path to the GLMTLMC release folder itself must not contain spaces or backslashes. The launch settings glmtlmc writes into Prism are split on spaces, so a folder like 'Downloads/glmtlmc-public 2' would break them. glmtlmc stops and tells you if it finds one; move or rename the folder (e.g. to '~/glmtlmc') and run it again.
+
+Gatekeeper Fix
+
+If something is still blocked after running glmtlmc with sudo:
+
+1. Open your terminal.
+2. Type 'sudo xattr -cr '
+3. Drag and drop your downloaded GLMTLMC release folder.
+4. Press enter and enter your password.
 
 Complementary Reimagined GLMTLMC Patch
 
