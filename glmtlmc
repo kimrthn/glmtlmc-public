@@ -26,7 +26,7 @@ BANNER_RESIZE_WAIT = 0.1
 VERB_WIDTH = 11
 
 # Project version, the single source of truth; see the Versioning section of the README.
-GLMTLMC_VERSION = "0.4.0"
+GLMTLMC_VERSION = "0.5.0-beta.1"
 LOGO = r"""
       ___           ___       ___           ___           ___       ___           ___
      /\  \         /\__\     /\__\         /\  \         /\__\     /\__\         /\  \
