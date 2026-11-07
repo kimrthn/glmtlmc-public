@@ -13,17 +13,40 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from xml.parsers.expat import ExpatError
 
 PROBE_TIMEOUT = 20
 BUILD_TIMEOUT = 120
 INDENT = "  "
+BANNER_RESIZE_WAIT = 0.1
 # Verb column width: wide enough for the longest verb, so the leaf names and the
 # paths line up under each other and a transcript reads as a table.
 VERB_WIDTH = 11
 
-MINECRAFT_VERSION = "26.2"
+# Project version, the single source of truth; see the Versioning section of the README.
+GLMTLMC_VERSION = "0.4.0"
+LOGO = r"""
+      ___           ___       ___           ___           ___       ___           ___
+     /\  \         /\__\     /\__\         /\  \         /\__\     /\__\         /\  \
+    /::\  \       /:/  /    /::|  |        \:\  \       /:/  /    /::|  |       /::\  \
+   /:/\:\  \     /:/  /    /:|:|  |         \:\  \     /:/  /    /:|:|  |      /:/\:\  \
+  /:/  \:\  \   /:/  /    /:/|:|__|__       /::\  \   /:/  /    /:/|:|__|__   /:/  \:\  \
+ /:/__/_\:\__\ /:/__/    /:/ |::::\__\     /:/\:\__\ /:/__/    /:/ |::::\__\ /:/__/ \:\__\
+ \:\  /\ \/__/ \:\  \    \/__/~~/:/  /    /:/  \/__/ \:\  \    \/__/~~/:/  / \:\  \  \/__/
+  \:\ \:\__\    \:\  \         /:/  /    /:/  /       \:\  \         /:/  /   \:\  \
+   \:\/:/  /     \:\  \       /:/  /     \/__/         \:\  \       /:/  /     \:\  \
+    \::/  /       \:\__\     /:/  /                     \:\__\     /:/  /       \:\__\
+     \/__/         \/__/     \/__/                       \/__/     \/__/         \/__/
+"""
+# Each release build patches exactly one Minecraft version; the release step stamps this line.
+MINECRAFT_VERSION = "26.3"
+# Minecraft 26.3 replaced GLFW with SDL3, so the windowing library differs per build.
+WINDOW_LIBRARY, WINDOW_LIBNAME_FLAG = {
+    "26.2": ("libglfw.3.dylib", "-Dorg.lwjgl.glfw.libname="),
+    "26.3": ("libSDL3.dylib", "-Dorg.lwjgl.sdl.libname="),
+}[MINECRAFT_VERSION]
 STACK_KEYS = ("OverrideJavaArgs", "JvmArgs", "OverrideCommands", "WrapperCommand")
 VR_LIB_NAME = "vr-lib"
 VR_GL_FIX_LIB = "libvr_glfix.dylib"
@@ -40,6 +63,8 @@ MOLTENVR_PATH_FLAGS = ("-Dorg.lwjgl.librarypath=", "-Djava.library.path=")
 MOLTENVR_JVM_FLAGS = MOLTENVR_PATH_FLAGS + (MOLTENVR_ZGC_FLAG,)
 IRIS_SHADER_BREAK_VERSION = (1, 11, 3)
 IRIS_SHADER_SAFE_VERSION = (1, 11, 2)
+# Sodium 0.9.2 declares itself incompatible with Iris 1.11.2 and older.
+SODIUM_IRIS_BREAK_VERSION = (0, 9, 2)
 IRIS_ISSUE = "IrisShaders/Iris issue #3373"
 MOD_LOADER_WORDS = ("fabric", "forge", "neoforge", "quilt")
 DOTTED_VERSION = re.compile(r"\d+(?:\.\d+)+")
@@ -102,6 +127,20 @@ class PhaseLine:
     def fail(self, reason):
         """The indented error under the title that failed."""
         print(RED + INDENT + "error: " + reason + RESET)
+
+
+def print_banner():
+    """The logo when it fits, and always the version a bug report needs."""
+    width = max(len(row) for row in LOGO.splitlines())
+    if IS_TTY:
+        if shutil.get_terminal_size().columns <= width:
+            # Terminal windows open 80 wide, and the logo wraps into noise there.
+            sys.stdout.write("\033[8;40;" + str(width + 2) + "t")
+            sys.stdout.flush()
+            time.sleep(BANNER_RESIZE_WAIT)
+        if shutil.get_terminal_size().columns > width:
+            print(LOGO)
+    print("glmtlmc " + GLMTLMC_VERSION + " for Minecraft " + MINECRAFT_VERSION + "\n")
 
 
 def is_macho(path):
@@ -418,16 +457,16 @@ def find_vulkan_icd(prefix):
     return None
 
 
-def find_glfw_dylib(script_dir):
-    explicit = os.environ.get("GLMTLMC_GLFW_LIB")
+def find_window_dylib(script_dir):
+    explicit = os.environ.get("GLMTLMC_WINDOW_LIB")
     if explicit:
         candidates = [explicit]
     else:
         candidates = [
-            os.path.join(script_dir, "stack", "lib", "libglfw.3.dylib"),
-            os.path.join(script_dir, "..", "GL46-Exp", "glfw", "build", "src", "libglfw.3.dylib"),
-            os.path.join(script_dir, "glfw", "build", "src", "libglfw.3.dylib"),
-            os.path.join(script_dir, "..", "glfw", "build", "src", "libglfw.3.dylib"),
+            os.path.join(script_dir, "stack", "lib", WINDOW_LIBRARY),
+            os.path.join(script_dir, "..", "GL46-Exp", "glfw", "build", "src", WINDOW_LIBRARY),
+            os.path.join(script_dir, "glfw", "build", "src", WINDOW_LIBRARY),
+            os.path.join(script_dir, "..", "glfw", "build", "src", WINDOW_LIBRARY),
         ]
     for candidate in candidates:
         if os.path.isfile(candidate):
@@ -538,10 +577,11 @@ def preserved_vr_glfix(content):
     return None
 
 
-# glmtlmc owns these three: they name the current stack and go stale on a move.
+# glmtlmc owns these: they name the current stack and go stale on a move.
 GLMTLMC_LIBNAME_PREFIXES = ("-Dorg.lwjgl.egl.libname=",
                             "-Dorg.lwjgl.opengl.libname=",
-                            "-Dorg.lwjgl.glfw.libname=")
+                            "-Dorg.lwjgl.glfw.libname=",
+                            "-Dorg.lwjgl.sdl.libname=")
 
 
 def user_jvm_flags(content):
@@ -564,7 +604,7 @@ def stack_search_dir(stack):
     return stack.get("search_dir") or stack["prefix"] + "/lib"
 
 
-def build_patch_values(prefix, glfw_path, icd_path, search_dir=None, preserved_flags=(), injected=()):
+def build_patch_values(prefix, window_path, icd_path, search_dir=None, preserved_flags=(), injected=()):
     """The four keys glmtlmc owns.
 
     search_dir defaults to the stack's lib/. preserved_flags are MoltenVR's own
@@ -576,10 +616,14 @@ def build_patch_values(prefix, glfw_path, icd_path, search_dir=None, preserved_f
     jvm_flags = [
         "-Dorg.lwjgl.egl.libname=" + prefix + "/lib/libEGL.dylib",
         "-Dorg.lwjgl.opengl.libname=" + prefix + "/lib/libGL.dylib",
-        "-Dorg.lwjgl.glfw.libname=" + glfw_path,
+        WINDOW_LIBNAME_FLAG + window_path,
     ]
     jvm_flags.extend(preserved_flags)
     inserted = [search_dir + "/libgl_interpose.dylib"] + list(injected)
+    # The shipped SDL only keeps desktop GL on EGL, and so on Mesa, with these set.
+    sdl_env = (" SDL_VIDEO_FORCE_EGL=1 SDL_EGL_LIBRARY=" + prefix + "/lib/libEGL.dylib"
+               + " SDL_OPENGL_LIBRARY=" + prefix + "/lib/libGL.dylib"
+               if WINDOW_LIBRARY == "libSDL3.dylib" else "")
     return {
         "OverrideJavaArgs": "true",
         "JvmArgs": '"' + " ".join(jvm_flags) + '"',
@@ -592,7 +636,7 @@ def build_patch_values(prefix, glfw_path, icd_path, search_dir=None, preserved_f
                            + ' EGL_PLATFORM=surfaceless'
                            + ' MESA_LOADER_DRIVER_OVERRIDE=zink'
                            + ' MESA_GL_VERSION_OVERRIDE=4.6'
-                           + ' MESA_GLSL_VERSION_OVERRIDE=460"'),
+                           + ' MESA_GLSL_VERSION_OVERRIDE=460' + sdl_env + '"'),
     }
 
 
@@ -601,7 +645,7 @@ def stack_paths(stack):
     paths = [
         os.path.join(prefix, "lib", "libEGL.dylib"),
         os.path.join(prefix, "lib", "libGL.dylib"),
-        stack["glfw_path"],
+        stack["window_path"],
         os.path.join(prefix, "lib", "libgl_interpose.dylib"),
         os.path.join(prefix, "lib"),
         os.path.join(prefix, "lib", "dri"),
@@ -624,8 +668,8 @@ def vr_search_exclusion(name):
     """
     if name == "libGL.dylib":
         return "it would shadow the system OpenGL"
-    if name.startswith("libglfw"):
-        return "GLFW is loaded by absolute path"
+    if name.startswith(("libglfw", "libSDL3")):
+        return "the windowing library is loaded by absolute path"
     return None
 
 
@@ -1008,8 +1052,8 @@ def instance_minecraft_version(instance_dir):
 def verify_instance_version(line, instance_dir):
     version = instance_minecraft_version(instance_dir)
     if version != MINECRAFT_VERSION:
-        raise PhaseError("instance is " + str(version or "missing")
-                         + ", expected " + MINECRAFT_VERSION)
+        raise PhaseError("instance is " + str(version or "missing") + ", this glmtlmc build is for "
+                         + MINECRAFT_VERSION + " — download the build for your Minecraft version")
 
 
 def refuse_duplicate_mods(line, instance_dir):
@@ -1024,6 +1068,21 @@ def refuse_duplicate_mods(line, instance_dir):
         raise PhaseError("duplicate mod jars would crash the game on startup -- "
                          "keep one and remove the other: " + "; ".join(dups))
     line.report("checked", "no duplicate mod jars")
+
+
+def refuse_incompatible_iris_sodium(line, instance_dir):
+    """Stop before a pair that fails at launch, or on NeoForge only on joining a world."""
+    mods_dir = instance_mods_dir(instance_dir)
+    iris = find_mod_jars(mods_dir, "iris")
+    sodium = find_mod_jars(mods_dir, "sodium")
+    if not iris or not sodium:
+        return
+    newest_iris, newest_sodium = newest_mod_jar(iris), newest_mod_jar(sodium)
+    if (newest_iris[1] and newest_sodium[1] and newest_iris[1] <= IRIS_SHADER_SAFE_VERSION
+            and newest_sodium[1] >= SODIUM_IRIS_BREAK_VERSION):
+        raise PhaseError(newest_sodium[0] + " does not work with " + newest_iris[0]
+                         + " — install Sodium 0.9.1 for this Iris")
+    line.report("checked", "Iris and Sodium versions work together")
 
 
 def probe_report(line, script_dir, stack):
@@ -1067,15 +1126,15 @@ def configure_kosmickrisp(line, stack):
 
 
 def link_translation_layer(line, script_dir, stack):
-    glfw_path = find_glfw_dylib(script_dir)
-    if glfw_path is None:
-        raise PhaseError("patched GLFW dylib not found (set GLMTLMC_GLFW_LIB)")
-    if " " in glfw_path:
-        raise PhaseError("glmtlmc requires a space-free path (current: " + glfw_path + ")")
-    if not is_macho(glfw_path):
-        raise PhaseError("not a Mach-O dylib: " + glfw_path)
-    line.report("glfw", os.path.relpath(glfw_path, script_dir))
-    stack["glfw_path"] = glfw_path
+    window_path = find_window_dylib(script_dir)
+    if window_path is None:
+        raise PhaseError("patched " + WINDOW_LIBRARY + " not found (set GLMTLMC_WINDOW_LIB)")
+    if " " in window_path:
+        raise PhaseError("glmtlmc requires a space-free path (current: " + window_path + ")")
+    if not is_macho(window_path):
+        raise PhaseError("not a Mach-O dylib: " + window_path)
+    line.report("window", os.path.relpath(window_path, script_dir))
+    stack["window_path"] = window_path
 
 
 def instance_mods_dir(instance_dir):
@@ -1163,7 +1222,8 @@ def injected_vr_libraries(line, content, stack):
     """
     preserved = preserved_vr_glfix(content)
     if stack.get("shim_dir") is None:
-        return (preserved,) if preserved else ()
+        # dyld refuses to start the game if an inserted library is missing.
+        return (preserved,) if preserved and os.path.isfile(preserved) else ()
     local = os.path.join(stack_search_dir(stack), VR_GL_FIX_LIB)
     if preserved is not None and preserved != local:
         line.report("repointed", local + " (was " + preserved + ")")
@@ -1179,6 +1239,9 @@ def inspect_shader_mods(line, instance_dir):
     run here instead of costing the user one.
     """
     mods_dir = instance_mods_dir(instance_dir)
+    if MINECRAFT_VERSION != "26.2":
+        # Iris 1.11.7 on 26.3 renders the eye views correctly, so the 26.2 pin does not apply.
+        return
     sodium = find_mod_jars(mods_dir, "sodium")
     if sodium:
         line.detail("Sodium " + mod_jar_text(newest_mod_jar(sodium)) + " — Iris "
@@ -1224,7 +1287,7 @@ def configure_custom_arguments(line, instance_dir, stack):
         preserved = with_moltenvr_flags(preserved, shim_dir)
     stack["preserved_jvm_flags"] = preserved
     stack["injected_libraries"] = injected_vr_libraries(line, content, stack)
-    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"],
+    values = build_patch_values(stack["prefix"], stack["window_path"], stack["icd_path"],
                                 stack_search_dir(stack), preserved, stack["injected_libraries"])
     back_up_config(line, instance_dir, content)
     for verb, detail in set_verdicts(general_key_values(content), values):
@@ -1233,7 +1296,7 @@ def configure_custom_arguments(line, instance_dir, stack):
 
 
 def verify_startup(line, instance_dir, stack):
-    values = build_patch_values(stack["prefix"], stack["glfw_path"], stack["icd_path"],
+    values = build_patch_values(stack["prefix"], stack["window_path"], stack["icd_path"],
                                 stack_search_dir(stack), stack["preserved_jvm_flags"],
                                 stack["injected_libraries"])
     current = dict(iter_key_values(read_file_bytes(os.path.join(instance_dir, "instance.cfg"))))
@@ -1445,7 +1508,7 @@ def verify_vr_library_path(line, content, stack):
         raise PhaseError(search_dir + " must not carry " + ", ".join(sorted(shadowing))
                          + " — dyld would substitute it for the system image")
     line.report("checked", "DYLD_LIBRARY_PATH is " + search_dir
-                + ", carrying no libGL.dylib and no libglfw")
+                + ", carrying no libGL.dylib and no windowing library")
 
 
 def verify_vr_startup(line, instance_dir, stack):
@@ -1461,6 +1524,13 @@ def verify_vr_startup(line, instance_dir, stack):
     for report_line in run_vr_collision_probe(prefix, stack["icd_path"],
                                               stack["search_dir"], library_dirs):
         line.detail(report_line)
+
+
+def instance_uses_vr(instance_dir):
+    """Whether the instance is patched for VR, so Update can keep it that way."""
+    content = read_file_bytes(os.path.join(instance_dir, "instance.cfg"))
+    search_dir = dict(wrapper_env_pairs(content)).get("DYLD_LIBRARY_PATH", "")
+    return preserved_vr_glfix(content) is not None or os.path.basename(search_dir) == VR_LIB_NAME
 
 
 def do_nothing(line):
@@ -1508,6 +1578,7 @@ def patch_phases(instance_dir, script_dir):
         ("Verifying hardware compatibility", lambda line: verify_hardware(line)),
         ("Verifying instance version", lambda line: verify_instance_version(line, instance_dir)),
         ("Checking for duplicate mods", lambda line: refuse_duplicate_mods(line, instance_dir)),
+        ("Checking Iris and Sodium", lambda line: refuse_incompatible_iris_sodium(line, instance_dir)),
         ("Getting report from Translation Layer", lambda line: probe_report(line, script_dir, stack)),
         ("Configuring MESA", lambda line: configure_mesa(line, stack)),
         ("Configuring KosmikKrisp", lambda line: configure_kosmickrisp(line, stack)),
@@ -1525,6 +1596,7 @@ def patch_vr_phases(instance_dir, script_dir):
         ("Verifying hardware compatibility", lambda line: verify_hardware(line)),
         ("Verifying instance version", lambda line: verify_instance_version(line, instance_dir)),
         ("Checking for duplicate mods", lambda line: refuse_duplicate_mods(line, instance_dir)),
+        ("Checking Iris and Sodium", lambda line: refuse_incompatible_iris_sodium(line, instance_dir)),
         ("Getting report from Translation Layer", lambda line: probe_report(line, script_dir, stack)),
         ("Configuring MESA", lambda line: configure_mesa(line, stack)),
         ("Configuring KosmikKrisp", lambda line: configure_kosmickrisp(line, stack)),
@@ -1724,7 +1796,7 @@ def ask_operation():
     if choice in ("2", "unpatch"):
         return "unpatch"
     if choice in ("3", "update"):
-        return "patch"
+        return "update"
     if choice in ("4", "vr"):
         return "patch-vr"
     print(RED + "Error: unknown choice" + RESET)
@@ -1732,6 +1804,7 @@ def ask_operation():
 
 
 def main():
+    print_banner()
     script_dir = ensure_inside_project()
     dequarantine(script_dir)
     drop_sudo()
@@ -1740,7 +1813,7 @@ def main():
     operation = ask_operation()
     if operation == "unpatch":
         phases = unpatch_phases(instance_dir)
-    elif operation == "patch-vr":
+    elif operation == "patch-vr" or (operation == "update" and instance_uses_vr(instance_dir)):
         phases = patch_vr_phases(instance_dir, script_dir)
     else:
         phases = patch_phases(instance_dir, script_dir)

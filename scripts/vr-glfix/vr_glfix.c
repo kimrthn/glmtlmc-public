@@ -87,6 +87,7 @@
 #include <OpenGL/gl.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -400,9 +401,51 @@ VRGLFIX_FORWARD_RET(GLboolean, glUnmapBuffer, (GLenum target), (target),
                     (GLboolean)0);
 
 /* ------------------------------------------------------------------ */
+/* The one OpenVR function Vivecraft 26.3 needs and the shim lacks      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * shortcut: MoltenVR's IVRSystem table leaves GetPropErrorNameFromEnum empty, and
+ * Vivecraft 26.3 calls it when a controller property read fails, which LWJGL turns
+ * into a NullPointerException. Fills that one slot of IVRSystem_022, the version
+ * Vivecraft's LWJGL asks for; remove once MoltenVR implements the function.
+ */
+#define IVRSYSTEM_TABLE "FnTable:IVRSystem_022"
+#define PROP_ERROR_NAME_SLOT 28
+
+static const char *propErrorName(int error) {
+  (void)error;
+  return "TrackedProp_Error";
+}
+
+static void fillShimTable(const struct mach_header *header, intptr_t slide) {
+  typedef void **(*get_interface_t)(const char *, int *);
+  Dl_info image;
+  const char *leaf;
+  void *shim;
+  get_interface_t getInterface;
+  void **table;
+  int error = 0;
+
+  (void)slide;
+  if (dladdr(header, &image) == 0 || image.dli_fname == NULL) return;
+  leaf = strrchr(image.dli_fname, '/');
+  if (leaf == NULL || strcmp(leaf, "/libopenvr_api.dylib") != 0) return;
+
+  shim = dlopen(image.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  getInterface = shim ? (get_interface_t)dlsym(shim, "VR_GetGenericInterface") : NULL;
+  table = getInterface ? getInterface(IVRSYSTEM_TABLE, &error) : NULL;
+  if (table == NULL || table[PROP_ERROR_NAME_SLOT] != NULL) return;
+
+  table[PROP_ERROR_NAME_SLOT] = (void *)propErrorName;
+  logLine("filled GetPropErrorNameFromEnum in the shim's IVRSystem table");
+}
+
+/* ------------------------------------------------------------------ */
 /* Load-time report: proves the tuples are in the binary                */
 /* ------------------------------------------------------------------ */
 
 __attribute__((constructor)) static void vrglfixAnnounce(void) {
   logLine("loaded, 25 GL entry points interposed away from OpenGL.framework");
+  _dyld_register_func_for_add_image(fillShimTable);
 }

@@ -83,7 +83,7 @@ A couple important pieces of this project
 <!-- GETTING STARTED -->
 ## Getting Started
 
-Download the latest release file. And save it to a non temporary location for eg Documents or your User folder.
+Open the latest release and download the zip for your Minecraft version: `glmtlmc-<version>-mc26.2.zip` for 26.2, `glmtlmc-<version>-mc26.3.zip` for 26.3. Each build only patches its own version. Save it to a non temporary location for eg Documents or your User folder.
 
 ### Prerequisites
 
@@ -91,7 +91,8 @@ Download the latest release file. And save it to a non temporary location for eg
 - Prism Launcher
 - Minecraft Ownership
 - Apple Silicon
-- Iris 1.11.2 & Sodium 9.1
+- Fabric or NeoForge if you want mods
+- Iris & Sodium for shaders (for VR: Iris 1.11.2 & Sodium 0.9.1, for NeoForge on 26.3: Sodium 0.9.3-beta.1 or newer)
 
 ### Installation
 
@@ -120,9 +121,28 @@ Complementary Reimagined GLMTLMC Patch
 
 Due to licensing problems we can't ship a prebuilt patched Complementary Reimagined shader specificaly modified for GLMTLMC. In order to adress this every release ships with a /shaders folder. Navigate to the appropriate subfolder and then read the instructions.
 
+VR and Voxy
+
+The Voxy patch below is in the 26.2 build only. VR is in both builds.
+
 Voxy GLMTLMC Apple Patch
 
 Bring Voxy back to Apple Silicon with shader support! Supports VR use too. Very powerful Mac recommended for running Voxy in VR. Due to licensing problems we can't ship a prebuilt patched Voxy jar. In order to adress this every new release ships with a /mods folder. Navigate to the appropriate subfolder and then read the instructions.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+
+
+<!-- VERSIONING -->
+## Versioning
+
+Releases are numbered `MAJOR.MINOR.PATCH` and tagged like `v0.4.0`. See [CHANGELOG.md](CHANGELOG.md) for what changed in each one.
+
+* `PATCH`: bug fixes only.
+* `MINOR`: a new Minecraft version, mod loader or feature, or a Mesa update.
+* `MAJOR`: a change that makes people redo their setup, or drops a Minecraft version.
+
+The project is on `0.x` for now. The Minecraft version is in the zip name, not the version number. Run `glmtlmc` to see which version you have.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
