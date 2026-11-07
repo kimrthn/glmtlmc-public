@@ -41,7 +41,7 @@ LOGO = r"""
      \/__/         \/__/     \/__/                       \/__/     \/__/         \/__/
 """
 # Each release build patches exactly one Minecraft version; the release step stamps this line.
-MINECRAFT_VERSION = "26.3"
+MINECRAFT_VERSION = "26.2"
 # Minecraft 26.3 replaced GLFW with SDL3, so the windowing library differs per build.
 WINDOW_LIBRARY, WINDOW_LIBNAME_FLAG = {
     "26.2": ("libglfw.3.dylib", "-Dorg.lwjgl.glfw.libname="),
