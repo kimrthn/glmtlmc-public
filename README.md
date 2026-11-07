@@ -83,6 +83,8 @@ A couple important pieces of this project
 <!-- GETTING STARTED -->
 ## Getting Started
 
+> **Experimental branch: 0.5.0-beta.1.** Shader packs run faster, but some triangles may show the wrong colour. For the standard build, use the `main` branch or the latest normal release.
+
 Open the latest release and download the zip for your Minecraft version: `glmtlmc-<version>-mc26.2.zip` for 26.2, `glmtlmc-<version>-mc26.3.zip` for 26.3. Each build only patches its own version. Save it to a non temporary location for eg Documents or your User folder.
 
 ### Prerequisites

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-beta.1 (2026-11-07, experimental)
+
+Mesa `411f4a9d5ed`: the 0.4.0 Mesa plus one experimental patch. Built separately from the standard release.
+
+- Made shader packs faster by skipping a slow compute pass for flat shading: about 33% on Retina and up to 84% on non-Retina screens, in a 1280×720 window. Plain Sodium gains about 4%.
+- Trade-off: pack or mod values marked `flat` now come from a triangle's first vertex instead of its last, so some triangles may show the wrong colour.
+
 ## 0.4.0 (2026-11-07)
 
 Mesa `1c1f9bbc7ec` plus one cleanup commit (`8f97a75b4dd`), now built without LLVM.
